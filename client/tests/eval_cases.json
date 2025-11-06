@@ -1,0 +1,60 @@
+[
+  {
+    "name": "success_human_p53",
+    "input": "Find human p53 protein details.",
+    "expected_output": {
+      "decision": "details",
+      "protein": "TP53",
+      "organism": "Homo sapiens"
+    },
+    "description": "Should successfully find TP53 protein in humans"
+  },
+  {
+    "name": "success_human_insulin",
+    "input": "Show me insulin from humans",
+    "expected_output": {
+      "decision": "details",
+      "protein": "INS",
+      "organism": "Homo sapiens"
+    },
+    "description": "Should find insulin protein in humans"
+  },
+  {
+    "name": "clarification_missing_organism",
+    "input": "Find p53",
+    "expected_output": {
+      "decision": "await_user",
+      "clarification_needed": true
+    },
+    "description": "Should ask for organism when missing"
+  },
+  {
+    "name": "success_brca1_human",
+    "input": "BRCA1 in humans",
+    "expected_output": {
+      "decision": "details",
+      "protein": "BRCA1",
+      "organism": "Homo sapiens"
+    },
+    "description": "Should find BRCA1 breast cancer protein"
+  },
+  {
+    "name": "success_mouse_egfr",
+    "input": "EGFR mouse",
+    "expected_output": {
+      "decision": "details",
+      "protein": "EGFR",
+      "organism": "Mus musculus"
+    },
+    "description": "Should find mouse EGFR"
+  },
+  {
+    "name": "clarification_missing_protein",
+    "input": "human",
+    "expected_output": {
+      "decision": "await_user",
+      "clarification_needed": true
+    },
+    "description": "Should ask for protein name when only organism provided"
+  }
+]

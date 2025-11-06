@@ -1,0 +1,723 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>🧬 Protein Search Chat</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+
+        .chat-container {
+            width: 90%;
+            max-width: 1200px;
+            height: 90vh;
+            background: white;
+            border-radius: 20px;
+            box-shadow: 0 20px 40px rgba(0,0,0,0.1);
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        .chat-header {
+            background: linear-gradient(135deg, #2c3e50 0%, #34495e 100%);
+            color: white;
+            padding: 20px;
+            text-align: center;
+            position: relative;
+        }
+
+        .chat-header h1 {
+            font-size: 24px;
+            margin-bottom: 5px;
+        }
+
+        .chat-header p {
+            opacity: 0.8;
+            font-size: 14px;
+        }
+
+        .status-indicator {
+            position: absolute;
+            top: 20px;
+            right: 20px;
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            background: #27ae60;
+            animation: pulse 2s infinite;
+        }
+
+        @keyframes pulse {
+            0% { opacity: 1; }
+            50% { opacity: 0.5; }
+            100% { opacity: 1; }
+        }
+
+        .chat-messages {
+            flex: 1;
+            padding: 20px;
+            overflow-y: auto;
+            background: #f8f9fa;
+            display: flex;
+            flex-direction: column;
+            gap: 15px;
+        }
+
+        .message {
+            display: flex;
+            align-items: flex-start;
+            gap: 12px;
+            animation: slideIn 0.3s ease-out;
+        }
+
+        @keyframes slideIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        .message.user {
+            flex-direction: row-reverse;
+        }
+
+        .message-avatar {
+            width: 40px;
+            height: 40px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 18px;
+            flex-shrink: 0;
+        }
+
+        .message.user .message-avatar {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+        }
+
+        .message.assistant .message-avatar {
+            background: linear-gradient(135deg, #2c3e50 0%, #34495e 100%);
+            color: white;
+        }
+
+        .message-content {
+            max-width: 80%;
+            padding: 15px 20px;
+            border-radius: 18px;
+            line-height: 1.5;
+            word-wrap: break-word;
+        }
+
+        .message.user .message-content {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border-bottom-right-radius: 5px;
+        }
+
+        .message.assistant .message-content {
+            background: white;
+            color: #2c3e50;
+            border: 1px solid #e9ecef;
+            border-bottom-left-radius: 5px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+
+        .message-content h2 {
+            font-size: 18px;
+            margin-bottom: 10px;
+            color: #2c3e50;
+        }
+
+        .message-content h3 {
+            font-size: 16px;
+            margin: 15px 0 8px 0;
+            color: #34495e;
+        }
+
+        .message-content h4 {
+            font-size: 14px;
+            margin: 10px 0 5px 0;
+            color: #7f8c8d;
+        }
+
+        .message-content ul {
+            margin: 8px 0;
+            padding-left: 20px;
+        }
+
+        .message-content li {
+            margin: 5px 0;
+        }
+
+        .message-content strong {
+            color: #2c3e50;
+        }
+
+        .message-content code {
+            background: #f1f2f6;
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-family: 'Courier New', monospace;
+            font-size: 13px;
+        }
+
+        .message-content .success {
+            color: #27ae60;
+        }
+
+        .message-content .error {
+            color: #e74c3c;
+        }
+
+        .message-content .info {
+            color: #3498db;
+        }
+
+        .chat-input-container {
+            padding: 20px;
+            background: white;
+            border-top: 1px solid #e9ecef;
+        }
+
+        .chat-input-wrapper {
+            display: flex;
+            gap: 10px;
+            align-items: flex-end;
+        }
+
+        .chat-input {
+            flex: 1;
+            min-height: 50px;
+            max-height: 120px;
+            padding: 15px 20px;
+            border: 2px solid #e9ecef;
+            border-radius: 25px;
+            font-size: 16px;
+            font-family: inherit;
+            resize: none;
+            outline: none;
+            transition: all 0.3s ease;
+        }
+
+        .chat-input:focus {
+            border-color: #667eea;
+            box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
+        }
+
+        .send-button {
+            width: 50px;
+            height: 50px;
+            border: none;
+            border-radius: 50%;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            font-size: 18px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .send-button:hover {
+            transform: scale(1.05);
+            box-shadow: 0 5px 15px rgba(102, 126, 234, 0.3);
+        }
+
+        .send-button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        .typing-indicator {
+            display: none;
+            align-items: center;
+            gap: 10px;
+            padding: 15px 20px;
+            background: white;
+            border-radius: 18px;
+            border: 1px solid #e9ecef;
+            max-width: 200px;
+            margin-bottom: 15px;
+        }
+
+        .typing-dots {
+            display: flex;
+            gap: 4px;
+        }
+
+        .typing-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: #bdc3c7;
+            animation: typing 1.4s infinite ease-in-out;
+        }
+
+        .typing-dot:nth-child(1) { animation-delay: -0.32s; }
+        .typing-dot:nth-child(2) { animation-delay: -0.16s; }
+
+        @keyframes typing {
+            0%, 80%, 100% { transform: scale(0.8); opacity: 0.5; }
+            40% { transform: scale(1); opacity: 1; }
+        }
+
+        .quick-actions {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            margin-bottom: 15px;
+        }
+
+        .quick-action {
+            padding: 8px 16px;
+            background: #f8f9fa;
+            border: 1px solid #e9ecef;
+            border-radius: 20px;
+            font-size: 14px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            color: #2c3e50;
+        }
+
+        .quick-action:hover {
+            background: #667eea;
+            color: white;
+            border-color: #667eea;
+        }
+
+        .error-message {
+            background: #fee;
+            color: #c33;
+            padding: 10px 15px;
+            border-radius: 8px;
+            border: 1px solid #fcc;
+            margin: 10px 0;
+        }
+
+        .welcome-message {
+            text-align: center;
+            color: #7f8c8d;
+            font-style: italic;
+            margin: 20px 0;
+        }
+
+        /* Scrollbar styling */
+        .chat-messages::-webkit-scrollbar {
+            width: 6px;
+        }
+
+        .chat-messages::-webkit-scrollbar-track {
+            background: #f1f1f1;
+            border-radius: 3px;
+        }
+
+        .chat-messages::-webkit-scrollbar-thumb {
+            background: #c1c1c1;
+            border-radius: 3px;
+        }
+
+        .chat-messages::-webkit-scrollbar-thumb:hover {
+            background: #a8a8a8;
+        }
+
+        /* Mobile responsiveness */
+        @media (max-width: 768px) {
+            .chat-container {
+                width: 100%;
+                height: 100vh;
+                border-radius: 0;
+            }
+            
+            .message-content {
+                max-width: 90%;
+            }
+            
+            .chat-header {
+                padding: 15px;
+            }
+            
+            .chat-header h1 {
+                font-size: 20px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="chat-container">
+        <div class="chat-header">
+            <div class="status-indicator" id="statusIndicator"></div>
+            <h1>🧬 Protein Search Assistant</h1>
+            <p>Ask me anything about proteins, genes, and biological data</p>
+        </div>
+        
+        <div class="chat-messages" id="chatMessages">
+            <div class="welcome-message">
+                👋 Welcome! I can help you search for proteins, analyze biological data, and answer questions about genes and proteins. Try asking me something!
+            </div>
+            
+            <div class="quick-actions">
+                <div class="quick-action" onclick="sendQuickMessage('Find insulin proteins in humans')">Find insulin proteins</div>
+                <div class="quick-action" onclick="sendQuickMessage('MHC class I antigen')">MHC class I antigen</div>
+                <div class="quick-action" onclick="sendQuickMessage('PDIb\'a\'-hLIF')">PDIb'a'-hLIF</div>
+                <div class="quick-action" onclick="sendQuickMessage('What proteins are secreted?')">Secreted proteins</div>
+                <div class="quick-action" onclick="sendQuickMessage('Find enzymes in the nucleus')">Nuclear enzymes</div>
+            </div>
+        </div>
+        
+        <div class="typing-indicator" id="typingIndicator">
+            <div class="message-avatar">🤖</div>
+            <div class="typing-dots">
+                <div class="typing-dot"></div>
+                <div class="typing-dot"></div>
+                <div class="typing-dot"></div>
+            </div>
+            <span>Searching proteins...</span>
+        </div>
+        
+        <div class="chat-input-container">
+            <div class="chat-input-wrapper">
+                <textarea 
+                    class="chat-input" 
+                    id="chatInput" 
+                    placeholder="Ask me about proteins, genes, or biological data..."
+                    rows="1"
+                ></textarea>
+                <button class="send-button" id="sendButton" onclick="sendMessage()">
+                    ➤
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Use relative URL for same-origin, or environment variable for cross-origin
+        const API_BASE = window.location.origin.includes('localhost') 
+            ? 'http://localhost:8001' 
+            : window.location.origin;
+        const chatMessages = document.getElementById('chatMessages');
+        const chatInput = document.getElementById('chatInput');
+        const sendButton = document.getElementById('sendButton');
+        const typingIndicator = document.getElementById('typingIndicator');
+        const statusIndicator = document.getElementById('statusIndicator');
+        
+        let isTyping = false;
+        let conversationHistory = [];
+        let currentSessionId = null;
+        let currentConversationId = null;  // Track conversation_id for state persistence
+        
+        function generateSessionId() {
+            return 'session_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
+        }
+        
+        // Auto-resize textarea
+        chatInput.addEventListener('input', function() {
+            this.style.height = 'auto';
+            this.style.height = Math.min(this.scrollHeight, 120) + 'px';
+        });
+        
+        // Send message on Enter (but allow Shift+Enter for new lines)
+        chatInput.addEventListener('keydown', function(e) {
+            if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                sendMessage();
+            }
+        });
+        
+        function sendQuickMessage(message) {
+            chatInput.value = message;
+            sendMessage();
+        }
+        
+        async function sendMessage() {
+            const message = chatInput.value.trim();
+            if (!message || isTyping) return;
+            
+            // Create session ID if starting new conversation
+            if (!currentSessionId) {
+                currentSessionId = generateSessionId();
+            }
+            
+            // Add user message to chat
+            addMessage('user', message);
+            
+            // Clear input and disable
+            chatInput.value = '';
+            chatInput.style.height = 'auto';
+            sendButton.disabled = true;
+            isTyping = true;
+            
+            // Show typing indicator
+            showTypingIndicator();
+            
+            try {
+                const response = await fetch(`${API_BASE}/query`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        query: message,
+                        conversation_id: currentConversationId  // Use tracked conversation_id
+                    })
+                });
+                
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+                }
+                
+                const data = await response.json();
+                
+                // Update conversation_id from response (important for exit command which returns new ID)
+                if (data.conversation_id) {
+                    currentConversationId = data.conversation_id;
+                }
+                
+                // Hide typing indicator
+                hideTypingIndicator();
+                
+                // Add assistant response
+                addMessage('assistant', data.response);
+                
+                // Store conversation history with workflow details
+                conversationHistory.push({
+                    role: 'user', 
+                    content: message,
+                    workflow_details: data.workflow_details || {}
+                });
+                conversationHistory.push({
+                    role: 'assistant', 
+                    content: data.response,
+                    workflow_details: data.workflow_details || {}
+                });
+                
+                // Check if user wants to exit - run evaluation on complete conversation
+                if (message.toLowerCase() === 'exit') {
+                    await evaluateCompleteConversation();
+                    // After exit, currentConversationId is already updated from response above
+                }
+                
+                // Update status
+                updateStatus('connected');
+                
+            } catch (error) {
+                console.error('Chat error:', error);
+                
+                // Hide typing indicator
+                hideTypingIndicator();
+                
+                // Show error message
+                addMessage('assistant', `❌ **Error**: ${error.message}\n\nMake sure the Docker container is running on port 8001.`);
+                
+                // Update status
+                updateStatus('error');
+            } finally {
+                // Re-enable input
+                sendButton.disabled = false;
+                isTyping = false;
+                chatInput.focus();
+            }
+        }
+        
+        async function evaluateCompleteConversation() {
+            if (conversationHistory.length === 0) {
+                addMessage('assistant', '⚠️ No conversation to evaluate');
+                return;
+            }
+            
+            // Build conversation summary with workflow details
+            let conversationSummary = '';
+            let userQuestions = [];
+            let assistantAnswers = [];
+            let allWorkflowDetails = [];
+            
+            conversationHistory.forEach(msg => {
+                if (msg.role === 'user') {
+                    userQuestions.push(msg.content);
+                } else {
+                    assistantAnswers.push(msg.content);
+                }
+                
+                if (msg.workflow_details && Object.keys(msg.workflow_details).length > 0) {
+                    allWorkflowDetails.push(msg.workflow_details);
+                }
+            });
+            
+            // Combine into evaluable format
+            conversationSummary = userQuestions.join('\n\n');
+            const finalAnswer = assistantAnswers[assistantAnswers.length - 1]; // Last assistant response
+            
+            // Build workflow summary
+            let workflowSummary = '\n\nWorkflow Execution Details:\n';
+            workflowSummary += JSON.stringify(allWorkflowDetails, null, 2);
+            
+                // Send to /evals endpoint with session tracking
+                try {
+                    addMessage('assistant', '⚖️ Evaluating conversation with workflow context...');
+                    const evalResponse = await fetch(`${API_BASE}/evals`, {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                        },
+                        body: JSON.stringify({
+                            question: conversationSummary + workflowSummary,
+                            answer: finalAnswer,
+                            decision: 'details',
+                            session_id: currentSessionId,
+                            workflow_details: allWorkflowDetails
+                        })
+                    });
+                    
+                    if (evalResponse.ok) {
+                        const evalData = await evalResponse.json();
+                        if (evalData.success) {
+                            addEvaluationResult(evalData.score, evalData.rationale);
+                            // Clear conversation history and reset session after evaluation
+                            conversationHistory = [];
+                            currentSessionId = null;
+                        } else {
+                            // Show error message if evaluation failed
+                            const errorMsg = evalData.error || 'Evaluation failed';
+                            addMessage('assistant', '⚠️ Evaluation error: ' + errorMsg);
+                            console.error('Evaluation failed:', evalData);
+                        }
+                    } else {
+                        const errorText = await evalResponse.text();
+                        addMessage('assistant', '⚠️ Evaluation request failed: ' + errorText);
+                    }
+                } catch (evalError) {
+                    console.error('Evaluation error:', evalError);
+                    addMessage('assistant', '⚠️ Evaluation failed: ' + evalError.message);
+                }
+        }
+        
+        function determineDecisionType(question, answer) {
+            // Simple heuristic to determine decision type based on answer content
+            if (answer.includes('refinement') || answer.includes('clarify') || answer.includes('Need more')) {
+                return 'await_user';
+            } else if (answer.includes('Accession:') || answer.includes('Name:') || answer.includes('Organism:')) {
+                return 'details';
+            }
+            return 'fallback';
+        }
+        
+        function addEvaluationResult(score, rationale) {
+            const evalDiv = document.createElement('div');
+            evalDiv.className = 'message assistant';
+            evalDiv.style.marginTop = '-10px';
+            
+            const avatar = document.createElement('div');
+            avatar.className = 'message-avatar';
+            avatar.textContent = '⚖️';
+            
+            const messageContent = document.createElement('div');
+            messageContent.className = 'message-content';
+            messageContent.style.background = '#fff3cd';
+            messageContent.style.borderColor = '#ffc107';
+            
+            messageContent.innerHTML = `
+                <p style="margin: 0;">
+                    <strong>🎯 Judge Score: ${score}/10</strong><br>
+                    <small style="color: #856404;">${rationale}</small>
+                </p>
+            `;
+            
+            evalDiv.appendChild(avatar);
+            evalDiv.appendChild(messageContent);
+            chatMessages.appendChild(evalDiv);
+            chatMessages.scrollTop = chatMessages.scrollHeight;
+        }
+        
+        function addMessage(sender, content) {
+            const messageDiv = document.createElement('div');
+            messageDiv.className = `message ${sender}`;
+            
+            const avatar = document.createElement('div');
+            avatar.className = 'message-avatar';
+            avatar.textContent = sender === 'user' ? '👤' : '🤖';
+            
+            const messageContent = document.createElement('div');
+            messageContent.className = 'message-content';
+            
+            // Convert markdown-like formatting to HTML
+            content = content
+                .replace(/## (.*?)\n/g, '<h2>$1</h2>')
+                .replace(/### (.*?)\n/g, '<h3>$1</h3>')
+                .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
+                .replace(/`(.*?)`/g, '<code>$1</code>')
+                .replace(/✅/g, '<span class="success">✅</span>')
+                .replace(/❌/g, '<span class="error">❌</span>')
+                .replace(/🔄/g, '<span class="info">🔄</span>')
+                .replace(/\n\n/g, '</p><p>')
+                .replace(/\n/g, '<br>');
+            
+            messageContent.innerHTML = `<p>${content}</p>`;
+            
+            messageDiv.appendChild(avatar);
+            messageDiv.appendChild(messageContent);
+            
+            chatMessages.appendChild(messageDiv);
+            chatMessages.scrollTop = chatMessages.scrollHeight;
+        }
+        
+        function showTypingIndicator() {
+            typingIndicator.style.display = 'flex';
+            chatMessages.appendChild(typingIndicator);
+            chatMessages.scrollTop = chatMessages.scrollHeight;
+        }
+        
+        function hideTypingIndicator() {
+            typingIndicator.style.display = 'none';
+            if (typingIndicator.parentNode) {
+                typingIndicator.parentNode.removeChild(typingIndicator);
+            }
+        }
+        
+        function updateStatus(status) {
+            statusIndicator.className = 'status-indicator';
+            if (status === 'connected') {
+                statusIndicator.style.background = '#27ae60';
+            } else if (status === 'error') {
+                statusIndicator.style.background = '#e74c3c';
+            } else {
+                statusIndicator.style.background = '#f39c12';
+            }
+        }
+        
+        // Test API connection on load
+        window.addEventListener('load', async function() {
+            try {
+                const response = await fetch(`${API_BASE}/health`);
+                if (response.ok) {
+                    updateStatus('connected');
+                    console.log('✅ API connection successful');
+                } else {
+                    updateStatus('error');
+                    console.warn('⚠️ API health check failed');
+                }
+            } catch (error) {
+                updateStatus('error');
+                console.warn('⚠️ Cannot connect to API:', error.message);
+            }
+        });
+        
+        // Focus input on load
+        chatInput.focus();
+    </script>
+</body>
+</html>
