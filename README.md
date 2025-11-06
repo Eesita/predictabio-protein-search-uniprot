@@ -127,6 +127,7 @@ See [DEPLOYMENT.md](DEPLOYMENT.md) for detailed deployment instructions.
 
 ## Documentation
 
+- [OVERVIEW.md](OVERVIEW.md) - Technical overview and workflow explanation
 - [DEPLOYMENT.md](DEPLOYMENT.md) - Deployment instructions
 - [EVALUATION_SUMMARY.md](EVALUATION_SUMMARY.md) - Evaluation framework details
 
