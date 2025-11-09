@@ -21,7 +21,6 @@ COPY mcp-server ./mcp-server
 # Copy the UI files
 COPY chat_ui.html ./
 COPY evalsview.html ./
-COPY serve_chat.py ./
 
 # Install MCP server deps and build
 WORKDIR /app/mcp-server

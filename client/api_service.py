@@ -3,16 +3,12 @@
 FastAPI microservice for conversational protein search
 """
 
-import asyncio
 import os
-import json
-import uuid
 from datetime import datetime
 from typing import Dict, Any, Optional, List
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
-from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from conversational_protein_client import ProteinClient
 
@@ -47,10 +43,6 @@ class QueryResponse(BaseModel):
 async def startup():
     """Initialize the conversational client on startup."""
     global conversational_client
-    mcp_server_path = os.getenv(
-        "MCP_SERVER_PATH", 
-        "/app/mcp-server/build/index.js"
-    )
     conversational_client = ProteinClient()
     await conversational_client.start()
     print("Conversational Protein Search API started")
@@ -101,17 +93,6 @@ async def process_query(request: QueryRequest) -> QueryResponse:
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error processing query: {str(e)}")
-
-@app.post("/conversation/clear")
-async def clear_conversation() -> Dict[str, str]:
-    """Clear the conversation history."""
-    if not conversational_client:
-        raise HTTPException(status_code=503, detail="Service not available")
-    
-    # State is managed by checkpointer per thread_id, so clearing is done by using a new thread_id
-    # The default thread_id will continue, but we can generate a new one for future requests
-    # For now, just return success - actual clearing happens when user starts a new conversation
-    return {"message": "Conversation history cleared. Use a new conversation_id or restart command to start fresh."}
 
 class EvalRequest(BaseModel):
     question: str
@@ -233,18 +214,6 @@ async def get_session_trace(session_id: str) -> Dict[str, Any]:
 async def serve_chat_ui():
     """Serve the main chat UI."""
     # Files are in /app/ directory (same as api_service.py)
-    html_path = os.path.join("/app", "chat_ui.html")
-    return FileResponse(html_path)
-
-@app.get("/chat")
-async def serve_chat_ui_alt():
-    """Alternative route for chat UI."""
-    html_path = os.path.join("/app", "chat_ui.html")
-    return FileResponse(html_path)
-
-@app.get("/chat_ui.html")
-async def serve_chat_ui_file():
-    """Serve the chat UI HTML file."""
     html_path = os.path.join("/app", "chat_ui.html")
     return FileResponse(html_path)
 

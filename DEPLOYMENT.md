@@ -66,8 +66,6 @@ Open in browser: https://{service_url}/
 ## UI Routes
 
 - Main UI: `/` (root)
-- Alternative: `/chat`
-- Direct file: `/chat_ui.html`
 - Evaluation view: `/evalsview`
 
 ## Key Points

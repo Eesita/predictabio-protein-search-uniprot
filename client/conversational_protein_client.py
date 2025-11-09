@@ -40,7 +40,6 @@ except ImportError:  # pragma: no cover - optional dependency
 
 load_dotenv()
 
-
 # ============================================================================
 # LLM CLIENT
 # ============================================================================
@@ -118,7 +117,6 @@ class LLMClient:
 LANGSMITH_PROJECT = os.getenv("LANGSMITH_PROJECT", "protein-search-evals")
 _LANGSMITH_CLIENT_SINGLETON: Optional['LangSmithClient'] = None
 
-
 def get_langsmith_client() -> Optional['LangSmithClient']:
     """Lazy-load LangSmith client when credentials are available."""
     global _LANGSMITH_CLIENT_SINGLETON
@@ -145,7 +143,6 @@ def get_langsmith_client() -> Optional['LangSmithClient']:
         _LANGSMITH_CLIENT_SINGLETON = None
     return _LANGSMITH_CLIENT_SINGLETON
 
-
 def _summarize_usage(events: List[Dict[str, Any]]) -> Dict[str, Optional[int]]:
     """Aggregate token usage across LLM calls."""
     if not events:
@@ -162,7 +159,6 @@ def _summarize_usage(events: List[Dict[str, Any]]) -> Dict[str, Optional[int]]:
         "completion_tokens": completion or None,
         "total_tokens": total or None,
     }
-
 
 async def _invoke_gemini_judge(prompt: str) -> Optional[str]:
     """Call Gemini with the supplied prompt, returning raw text output."""
@@ -193,7 +189,6 @@ async def _invoke_gemini_judge(prompt: str) -> Optional[str]:
 
     return await asyncio.to_thread(_call)
 
-
 def _extract_json_object(text: str) -> Optional[Dict[str, Any]]:
     """Attempt to parse a JSON object from arbitrary text output."""
     if not text:
@@ -209,7 +204,6 @@ def _extract_json_object(text: str) -> Optional[Dict[str, Any]]:
         return json.loads(candidate)
     except json.JSONDecodeError:
         return None
-
 
 async def run_llm_judge(
     user_message: str,
@@ -327,7 +321,6 @@ Instructions:
     print(f"[LLM Judge] Score: {score_value}/10 | Rationale: {judge_output['rationale']}")
     return judge_output
 
-
 def _safe_create_feedback(
     client: "LangSmithClient",
     run_id: Optional[str],
@@ -354,18 +347,6 @@ def _safe_create_feedback(
         print(f"[LangSmith] Feedback '{key}' attached successfully")
     except Exception as exc:  # pragma: no cover - network issues
         print(f"[LangSmith] Failed to create feedback '{key}': {exc}")
-
-
-def _normalize_run_id(run_obj: Any) -> Optional[str]:
-    """Extract the run id regardless of schema type."""
-    if not run_obj:
-        return None
-    if hasattr(run_obj, "id"):
-        return str(run_obj.id)
-    if isinstance(run_obj, dict) and run_obj.get("id"):
-        return str(run_obj["id"])
-    return None
-
 
 # ============================================================================
 # STATE / MEMORY
@@ -399,7 +380,6 @@ class WorkflowState(TypedDict):
     retry_count: int
     retry_alternates: List[str]  # Store list of alternates to try
     retry_alternate_index: int   # Track which alternate we're currently trying
-
 
 def _state_context_snapshot(state: WorkflowState) -> Dict[str, Any]:
     """Return a trimmed snapshot of the current state for logging/evaluation."""
@@ -436,9 +416,6 @@ def _state_context_snapshot(state: WorkflowState) -> Dict[str, Any]:
         "filter_summary_text": state.get("filter_summary_text"),
         "search_attempts": attempt_summary,
     }
-
-
-
 
 async def log_langsmith_evaluation(
     *,
@@ -538,7 +515,6 @@ async def log_langsmith_evaluation(
         "state_snapshot",
         value=state_snapshot,
     )
-
 
 # ============================================================================
 # LANGGRAPH WORKFLOW: Protein Search and Selection Flow
@@ -1259,7 +1235,6 @@ def build_workflow(llm_client: 'LLMClient', mcp: 'ProteinSearchClient'):
     checkpointer = MemorySaver()
     return graph.compile(checkpointer=checkpointer)
 
-
 # ============================================================================
 # HELPERS: RENDERINGS & INPUT PARSING
 # ============================================================================
@@ -1410,176 +1385,6 @@ def _normalize_organism_name(name: str) -> str:
         return name
     return COMMON_ORGANISMS.get(name.lower(), name)
 
-def _normalize_token(value: str) -> str:
-    return re.sub(r"[^a-z0-9]", "", value.lower()) if value else ""
-
-def _user_mentions_numbers(text: str) -> bool:
-    return bool(re.search(r"\d", text or ""))
-
-def _build_query_from_plan(plan: Dict[str, Any], fallback: str) -> Tuple[str, Dict[str, Any], List[str]]:
-    clauses: List[str] = []
-    filters_summary: Dict[str, Any] = {}
-    summary_lines: List[str] = []
-
-    base_query = plan.get("base_query")
-    if base_query:
-        clauses.append(base_query)
-        filters_summary["base_query"] = base_query
-
-    # Functional role handling (NEW)
-    functional_role = plan.get("functional_role")
-    if functional_role:
-        role_lower = functional_role.lower()
-        if role_lower in ["receptor", "ligand"]:
-            clauses.append(f'protein_name:*{functional_role}*')
-        elif role_lower in ["enzyme", "kinase", "protease", "phosphatase"]:
-            # Enzyme names usually end in -ase
-            if base_query and not base_query.endswith("ase"):
-                clauses.append(f'protein_name:*{base_query}ase* OR keyword:"{role_lower}"')
-            else:
-                clauses.append(f'keyword:"{role_lower}"')
-        elif role_lower in ["inhibitor", "modulator", "activator"]:
-            clauses.append(f'keyword:"{role_lower}"')
-        elif role_lower in ["transporter", "channel"]:
-            clauses.append(f'keyword:"{role_lower}"')
-        summary_lines.append(f"Functional role: {functional_role}")
-        filters_summary["functional_role"] = functional_role
-
-    gene_symbols = plan.get("gene_symbols") or []
-    if gene_symbols:
-        for gene in gene_symbols:
-            gene_clause = f'gene:{gene}'
-            clauses.append(gene_clause)
-        summary_lines.append(f"Gene symbols: {', '.join(gene_symbols)}")
-        filters_summary["gene_symbols"] = gene_symbols
-
-    localizations = plan.get("localizations") or []
-    if localizations:
-        for loc in localizations:
-            clauses.append(f'cc_subcellular_location:"{loc}"')
-        summary_lines.append(f"Localization: {', '.join(localizations)}")
-        filters_summary["localizations"] = localizations
-
-    go_terms = plan.get("go_terms") or []
-    if go_terms:
-        for go in go_terms:
-            clauses.append(f'go:{go}')
-        summary_lines.append(f"GO terms: {', '.join(go_terms)}")
-        filters_summary["go_terms"] = go_terms
-
-    # PTMs (NEW)
-    ptms = plan.get("ptms") or []
-    if ptms:
-        for ptm in ptms:
-            # Map common PTM terms to UniProt fields
-            ptm_mapping = {
-                "phosphorylation": "Phosphoprotein",
-                "glycosylation": "Glycoprotein",
-                "acetylation": "Acetylation",
-                "ubiquitination": "Ubl conjugation",
-                "methylation": "Methylation"
-            }
-            ptm_keyword = ptm_mapping.get(ptm.lower(), ptm)
-            clauses.append(f'keyword:"{ptm_keyword}"')
-        summary_lines.append(f"PTMs: {', '.join(ptms)}")
-        filters_summary["ptms"] = ptms
-
-    # Domains (NEW)
-    domains = plan.get("domains") or []
-    if domains:
-        for domain in domains:
-            clauses.append(f'ft_domain:"{domain}"')
-        summary_lines.append(f"Domains: {', '.join(domains)}")
-        filters_summary["domains"] = domains
-
-    # Pathways (NEW)
-    pathways = plan.get("pathways") or []
-    if pathways:
-        for pathway in pathways:
-            clauses.append(f'cc_pathway:"{pathway}"')
-        summary_lines.append(f"Pathways: {', '.join(pathways)}")
-        filters_summary["pathways"] = pathways
-
-    # Disease association (NEW)
-    disease = plan.get("disease_association")
-    if disease:
-        clauses.append(f'cc_disease:"{disease}"')
-        summary_lines.append(f"Disease: {disease}")
-        filters_summary["disease_association"] = disease
-
-
-    keywords = plan.get("keywords") or []
-    if keywords:
-        for kw in keywords:
-            clauses.append(f'keyword:"{kw}"')
-        summary_lines.append(f"Keywords: {', '.join(keywords)}")
-        filters_summary["keywords"] = keywords
-
-    length_range = plan.get("length") or {}
-    length_min = length_range.get("min")
-    length_max = length_range.get("max")
-    if length_min or length_max:
-        min_val = length_min if length_min is not None else "*"
-        max_val = length_max if length_max is not None else "*"
-        # # ✅ FIX: Use concrete numbers - asterisk causes 400 errors from server
-        # min_val = int(length_min) if length_min is not None else 1
-        # max_val = int(length_max) if length_max is not None else 50000
-
-        # # ✅ FIX: Define length_clause FIRST
-        # length_clause = f'length:[{min_val} TO {max_val}]'
-
-        # # ✅ ADD THIS: Log the exact clause
-        # print(f"[ENCODING DEBUG] Length clause: {length_clause!r}")
-        # print(f"[ENCODING DEBUG] Length clause bytes: {length_clause.encode('utf-8')}")
-        # print(f"[ENCODING DEBUG] Has asterisk: {'*' in length_clause}")
-
-        clauses.append(f'length:[{min_val} TO {max_val}]')
-        summary_lines.append(f"Length range: {min_val}–{max_val} aa")
-        filters_summary["length"] = {"min": length_min, "max": length_max}
-
-    mass_range = plan.get("mass") or {}
-    mass_min = mass_range.get("min")
-    mass_max = mass_range.get("max")
-    if mass_min or mass_max:
-        min_val = mass_min if mass_min is not None else "*"
-        max_val = mass_max if mass_max is not None else "*"
-
-        # # ✅ FIX: Same for mass
-        # min_val = int(mass_min) if mass_min is not None else 1
-        # max_val = int(mass_max) if mass_max is not None else 1000000
-
-        clauses.append(f'mass:[{min_val} TO {max_val}]')
-        summary_lines.append(f"Mass range: {min_val}–{max_val} Da")
-        filters_summary["mass"] = {"min": mass_min, "max": mass_max}
-
-    organism_info = plan.get("organism_taxonomy")
-    organism = plan.get("organism")
-    if organism_info:
-        tax_id = organism_info.get("id")
-        label = organism_info.get("label")
-        if tax_id:
-            clauses.append(f'organism_id:"{tax_id}"')
-            summary_lines.append(f"Organism taxonomy ID: {tax_id}")
-            filters_summary["organism_taxonomy"] = organism_info
-        if label:
-            filters_summary["organism"] = label
-    elif organism:
-        normalized_org = _normalize_organism_name(organism)
-        clauses.append(f'organism:"{normalized_org}"')
-        summary_lines.append(f"Organism: {normalized_org}")
-        filters_summary["organism"] = normalized_org
-
-    query = " AND ".join([c for c in clauses if c.strip()])
-    if not query:
-        query = fallback
-
-    # # ✅ ADD THIS: Log final query
-    # print(f"[ENCODING DEBUG] Final query built: {query!r}")
-    # print(f"[ENCODING DEBUG] Query length: {len(query)}")
-
-    return query, filters_summary, summary_lines
-
-
 def _summarize_facets(results: List[Any]) -> Dict[str, Any]:
     if not results:
         return {}
@@ -1639,11 +1444,9 @@ def _summarize_facets(results: List[Any]) -> Dict[str, Any]:
     }
     return facets
 
-
 def _update_attempt_history(existing: List[Dict[str, Any]], attempt: Dict[str, Any], limit: int = 5) -> List[Dict[str, Any]]:
     combined = (existing or []) + [attempt]
     return combined[-limit:]
-
 
 def _format_attempt_steps(attempts: List[Dict[str, Any]]) -> str:
     if not attempts:
@@ -1656,26 +1459,6 @@ def _format_attempt_steps(attempts: List[Dict[str, Any]]) -> str:
         steps_text = " → ".join(step_descriptions) if step_descriptions else "no steps recorded"
         lines.append(f"{idx}. hits={att.get('result_count')} | {steps_text}")
     return "\n".join(lines)
-
-
-def _format_filter_summary(filters_summary: Dict[str, Any], summary_lines: List[str]) -> str:
-    if summary_lines:
-        return "; ".join(summary_lines)
-    if filters_summary:
-        rendered = []
-        for k, v in filters_summary.items():
-            if not v:
-                continue
-            if isinstance(v, dict):
-                if "label" in v and "id" in v:
-                    rendered.append(f"{k}: {v['label']} (tax:{v['id']})")
-                else:
-                    continue
-            else:
-                rendered.append(f"{k}: {v}")
-        return "; ".join(rendered) if rendered else "No explicit filters applied."
-    return "No explicit filters applied."
-
 
 def _build_narrow_prompt(
     normalized_query: str,
@@ -1711,9 +1494,6 @@ def _build_narrow_prompt(
         "Keep the response concise and avoid generic advice."
     )
     return prompt
-
-
-
 
 # ============================================================================
 # MAIN FLOW
@@ -1898,25 +1678,24 @@ async def process(llm: LLMClient, mcp: ProteinSearchClient, user_message: str, t
             print(f"[DECISION] Final message (workflow ended): {final_message}")
     # Fallback to clarification_message if no assistant_message
     elif clarification_message:
-        decision = "await_user"
         final_message = clarification_message
         print(f"[DECISION] Using clarification message")
-    else:
-        # Fallback - only ask for what's actually missing
-        missing_parts = []
-        if not protein_name:
-            missing_parts.append("protein name")
-        if not organism:
-            missing_parts.append("organism")
+    # else:
+    #     # Fallback - only ask for what's actually missing
+    #     missing_parts = []
+    #     if not protein_name:
+    #         missing_parts.append("protein name")
+    #     if not organism:
+    #         missing_parts.append("organism")
         
-        if missing_parts:
-            fallback = f"Please provide: {', '.join(missing_parts)}."
-        else:
-            fallback = "Please provide protein name and organism to proceed."
+    #     if missing_parts:
+    #         fallback = f"Please provide: {', '.join(missing_parts)}."
+    #     else:
+    #         fallback = "Please provide protein name and organism to proceed."
         
-        final_message = fallback
-        decision = "fallback"
-        print(f"[DECISION] Fallback clarification")
+    #     final_message = fallback
+    #     decision = "fallback"
+    #     print(f"[DECISION] Fallback clarification")
 
     print(f"{'='*80}\n")
     
@@ -1959,25 +1738,3 @@ class ProteinClient:
         response, workflow_details = await process(self.llm, self.mcp, question, thread, self.workflow)
         return response, workflow_details
 
-
-# ============================================================================
-# MAIN
-# ============================================================================
-
-async def main():
-    client = ProteinClient()
-    await client.start()
-    
-    print("Protein Search Client\n")
-    
-    while True:
-        question = input("You: ")
-        print()
-        response, workflow_details = await client.ask(question)
-        print(f"Assistant:\n{response}\n")
-    
-    await client.stop()
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
