@@ -92,6 +92,10 @@ async def process_query(request: QueryRequest) -> QueryResponse:
         )
         
     except Exception as e:
+        import traceback
+        error_trace = traceback.format_exc()
+        print(f"[api_service] Error processing query: {e}")
+        print(f"[api_service] Traceback: {error_trace}")
         raise HTTPException(status_code=500, detail=f"Error processing query: {str(e)}")
 
 class EvalRequest(BaseModel):

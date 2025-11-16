@@ -8,6 +8,7 @@ Type: llm + tool + human-in-loop hybrid workflow
 """
 
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -20,9 +21,14 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph.message import add_messages
 from langgraph.types import interrupt, Command
+import pandas as pd
 from protein_search_client import ProteinSearchClient
 from organism_resolver import OrganismResolver
 from search_agent import SearchAgent
+from external_apis import fetch_metadata
+from scripts.filter1 import filter_growth_factors
+from scripts.extract_parameters import extract_parameters_from_dataframe
+from scripts.filter_human_ecoli import filter_human_ecoli_gf
 from dotenv import load_dotenv
 
 try:
@@ -39,6 +45,97 @@ except ImportError:  # pragma: no cover - optional dependency
     RunnableConfig = None  # type: ignore
 
 load_dotenv()
+
+# ============================================================================
+# METADATA CACHE (for large datasets)
+# ============================================================================
+
+# In-memory cache for metadata that's too large for state
+# Key: cache_id (e.g., "metadata_thread123_1234567890")
+# Value: Full metadata payload with records
+_metadata_cache: Dict[str, Dict[str, Any]] = {}
+
+# Mapping of thread_id to cache_ids for cleanup
+_thread_cache_mapping: Dict[str, List[str]] = {}
+
+# Threshold for using external cache (number of articles)
+METADATA_CACHE_THRESHOLD = 100
+
+
+def get_metadata_from_cache(cache_id: str) -> Optional[Dict[str, Any]]:
+    """Retrieve full metadata from cache by cache_id"""
+    return _metadata_cache.get(cache_id)
+
+
+def cleanup_metadata_cache(thread_id: str):
+    """Remove all cache entries for a given thread_id"""
+    if thread_id in _thread_cache_mapping:
+        cache_ids = _thread_cache_mapping[thread_id]
+        for cache_id in cache_ids:
+            if cache_id in _metadata_cache:
+                del _metadata_cache[cache_id]
+        del _thread_cache_mapping[thread_id]
+        if cache_ids:
+            print(f"[CACHE] Cleaned up {len(cache_ids)} cache entries for thread: {thread_id}")
+    else:
+        # Fallback: cleanup by pattern matching (for cache_ids created before mapping)
+        # This handles cases where cache was created but mapping wasn't updated
+        keys_to_remove = [
+            key for key in _metadata_cache.keys()
+            if key.startswith("metadata_")
+        ]
+        # Only remove if we have very few entries (safety check)
+        if len(keys_to_remove) < 100:  # Safety threshold
+            for key in keys_to_remove:
+                del _metadata_cache[key]
+            if keys_to_remove:
+                print(f"[CACHE] Cleaned up {len(keys_to_remove)} cache entries (pattern-based cleanup)")
+
+
+def register_cache_for_thread(thread_id: str, cache_id: str):
+    """Register a cache_id for a thread_id to enable cleanup"""
+    if thread_id not in _thread_cache_mapping:
+        _thread_cache_mapping[thread_id] = []
+    if cache_id not in _thread_cache_mapping[thread_id]:
+        _thread_cache_mapping[thread_id].append(cache_id)
+
+
+def cleanup_stale_cache(max_age_seconds: int = 3600):
+    """Remove cache entries older than max_age_seconds (safety cleanup)"""
+    current_time = time.time()
+    stale_keys = []
+    
+    for cache_id, metadata in _metadata_cache.items():
+        generated_at = metadata.get("generated_at", "")
+        if generated_at:
+            try:
+                # Parse ISO timestamp
+                gen_time = datetime.fromisoformat(generated_at.replace('Z', '+00:00'))
+                if gen_time.tzinfo:
+                    gen_timestamp = gen_time.timestamp()
+                else:
+                    gen_timestamp = datetime.timestamp(gen_time)
+                
+                if current_time - gen_timestamp > max_age_seconds:
+                    stale_keys.append(cache_id)
+            except (ValueError, AttributeError):
+                # If timestamp parsing fails, skip
+                pass
+    
+    for key in stale_keys:
+        if key in _metadata_cache:
+            del _metadata_cache[key]
+    
+    # Clean up thread mapping
+    for thread_id, cache_ids in list(_thread_cache_mapping.items()):
+        _thread_cache_mapping[thread_id] = [
+            cid for cid in cache_ids if cid not in stale_keys
+        ]
+        if not _thread_cache_mapping[thread_id]:
+            del _thread_cache_mapping[thread_id]
+    
+    if stale_keys:
+        print(f"[CACHE] Cleaned up {len(stale_keys)} stale cache entries (older than {max_age_seconds}s)")
 
 # ============================================================================
 # LLM CLIENT
@@ -380,6 +477,9 @@ class WorkflowState(TypedDict):
     retry_count: int
     retry_alternates: List[str]  # Store list of alternates to try
     retry_alternate_index: int   # Track which alternate we're currently trying
+    
+    # Metadata payload from external API (serialized for checkpointer)
+    protein_metadata: Optional[Dict[str, Any]]
 
 def _state_context_snapshot(state: WorkflowState) -> Dict[str, Any]:
     """Return a trimmed snapshot of the current state for logging/evaluation."""
@@ -1167,6 +1267,499 @@ def build_workflow(llm_client: 'LLMClient', mcp: 'ProteinSearchClient'):
             "chat_history": [{"role": "assistant", "content": message}],  # Auto-append!
         }
 
+    # metadata_fetcher_node (API call)
+    async def metadata_fetcher_node(state: WorkflowState) -> Dict[str, Any]:
+        """Fetch metadata for the selected protein from external sources."""
+        print("\n[metadata_fetcher_node] Fetching metadata for selected protein...")
+
+        selected = state.get("selected_protein")
+        if not selected:
+            print("[metadata_fetcher_node] No selected protein, skipping metadata fetch")
+            return {}
+
+        protein_name = getattr(selected, "name", None) or state.get("protein_name", "")
+        if not protein_name:
+            print("[metadata_fetcher_node] No protein name available, skipping metadata fetch")
+            return {}
+
+        print(f"[metadata_fetcher_node] Fetching metadata for: {protein_name}")
+
+        metadata_sources = ["pubmed", "semantic_scholar"]
+        metadata_start = "2020-01"
+        metadata_end = "2021-01"
+        metadata_df = await fetch_metadata(
+            queries=[protein_name],
+            sources=metadata_sources,
+            start_date=metadata_start,
+            end_date=metadata_end,
+            intelligent_query=True
+        )
+
+        if metadata_df is None:
+            print("[metadata_fetcher_node] Metadata fetch failed or returned None")
+            return {"protein_metadata": None}
+
+        metadata_payload: Dict[str, Any]
+        total_results = 0
+        source_counts: Dict[str, int] = {}
+
+        if isinstance(metadata_df, pd.DataFrame) and not metadata_df.empty:
+            total_results = len(metadata_df)
+            if 'source' in metadata_df.columns:
+                source_counts = metadata_df['source'].value_counts().to_dict()
+            
+            # Determine if data is large enough for external cache
+            use_cache = total_results > METADATA_CACHE_THRESHOLD
+            
+            if use_cache:
+                # Large dataset - store in external cache
+                # Generate unique cache_id using protein_name hash + timestamp
+                protein_hash = hashlib.md5(protein_name.encode()).hexdigest()[:8]
+                timestamp = int(time.time())
+                cache_id = f"metadata_{protein_hash}_{timestamp}"
+                
+                # Store full data in cache
+                full_metadata = {
+                    "records": metadata_df.to_dict(orient="records"),
+                    "columns": list(metadata_df.columns),
+                    "shape": list(metadata_df.shape),
+                    "dtypes": {col: str(dtype) for col, dtype in metadata_df.dtypes.items()},
+                    "source_counts": source_counts,
+                    "query": protein_name,
+                    "sources": metadata_sources,
+                    "start_date": metadata_start,
+                    "end_date": metadata_end,
+                    "generated_at": datetime.utcnow().isoformat(),
+                }
+                _metadata_cache[cache_id] = full_metadata
+                
+                # Track cache_id for cleanup (we'll need to get thread_id from config later)
+                # For now, we'll use a pattern-based cleanup approach
+                
+                # Store only reference + summary in state
+                metadata_payload = {
+                    "cache_id": cache_id,  # Reference to cache
+                    "summary": {
+                        "total_count": total_results,
+                        "columns": list(metadata_df.columns),
+                        "shape": list(metadata_df.shape),
+                        "sources": source_counts,
+                    },
+                    "query": protein_name,
+                    "sources": metadata_sources,
+                    "start_date": metadata_start,
+                    "end_date": metadata_end,
+                    "generated_at": datetime.utcnow().isoformat(),
+                }
+                print(f"[metadata_fetcher_node] Metadata fetched successfully: {total_results} articles (stored in cache: {cache_id})")
+            else:
+                # Small dataset - store directly in state
+                metadata_payload = {
+                    "records": metadata_df.to_dict(orient="records"),
+                    "columns": list(metadata_df.columns),
+                    "shape": list(metadata_df.shape),
+                    "dtypes": {col: str(dtype) for col, dtype in metadata_df.dtypes.items()},
+                    "source_counts": source_counts,
+                    "query": protein_name,
+                    "sources": metadata_sources,
+                    "start_date": metadata_start,
+                    "end_date": metadata_end,
+                    "generated_at": datetime.utcnow().isoformat(),
+                }
+                print(f"[metadata_fetcher_node] Metadata fetched successfully: {total_results} articles (stored in state)")
+        else:
+            metadata_payload = {
+                "records": [],
+                "columns": [],
+                "shape": [0, 0],
+                "dtypes": {},
+                "source_counts": {},
+                "query": protein_name,
+                "sources": metadata_sources,
+                "start_date": metadata_start,
+                "end_date": metadata_end,
+                "generated_at": datetime.utcnow().isoformat(),
+            }
+            print("[metadata_fetcher_node] Metadata DataFrame is empty")
+
+        if total_results > 0:
+            source_info = ""
+            if source_counts:
+                source_info = f" ({', '.join([f'{k}: {v}' for k, v in source_counts.items()])})"
+            metadata_summary = (
+                f"\n\n📚 **Research Metadata**: Found {total_results} articles "
+                f"from PubMed and Semantic Scholar{source_info}"
+            )
+        else:
+            metadata_summary = (
+                f"\n\n📚 **Research Metadata**: No articles found for '{protein_name}'"
+            )
+
+        current_message = state.get("assistant_message", "")
+
+        return {
+            "protein_metadata": metadata_payload,
+            "assistant_message": current_message + metadata_summary,
+            "chat_history": [{"role": "assistant", "content": metadata_summary}],
+        }
+
+    # metadata_processor_node - Read from cache and convert to DataFrame
+    async def metadata_processor_node(state: WorkflowState) -> Dict[str, Any]:
+        """Read metadata from cache (if cached) or state, convert to DataFrame, and print it."""
+        print("\n[metadata_processor_node] Processing metadata...")
+        
+        metadata_payload = state.get("protein_metadata")
+        if not metadata_payload:
+            print("[metadata_processor_node] No metadata payload found in state")
+            return {}
+        
+        metadata_df: Optional[pd.DataFrame] = None
+        
+        # Check if metadata is stored in cache (large dataset)
+        if "cache_id" in metadata_payload:
+            cache_id = metadata_payload.get("cache_id")
+            print(f"[metadata_processor_node] Retrieving metadata from cache: {cache_id}")
+            
+            # Retrieve full data from cache
+            cached_data = get_metadata_from_cache(cache_id)
+            if cached_data and "records" in cached_data:
+                # Convert cached records to DataFrame
+                records = cached_data.get("records", [])
+                columns = cached_data.get("columns", [])
+                
+                if records and columns:
+                    metadata_df = pd.DataFrame(records, columns=columns)
+                    print(f"[metadata_processor_node] Successfully loaded {len(metadata_df)} articles from cache")
+                else:
+                    print("[metadata_processor_node] Cache data missing records or columns")
+            else:
+                print(f"[metadata_processor_node] Cache entry not found or invalid for cache_id: {cache_id}")
+        else:
+            # Small dataset - data is already in state
+            print("[metadata_processor_node] Metadata stored in state (small dataset)")
+            records = metadata_payload.get("records", [])
+            columns = metadata_payload.get("columns", [])
+            
+            if records and columns:
+                metadata_df = pd.DataFrame(records, columns=columns)
+                print(f"[metadata_processor_node] Successfully loaded {len(metadata_df)} articles from state")
+            else:
+                print("[metadata_processor_node] No records found in state metadata")
+        
+        # Apply filtering if DataFrame is available
+        if metadata_df is not None and not metadata_df.empty:
+            original_count = len(metadata_df)
+            print(f"\n[metadata_processor_node] Applying growth factor filter to {original_count} articles...")
+            
+            # Apply filter
+            filtered_df = filter_growth_factors(metadata_df)
+            filtered_count = len(filtered_df) if filtered_df is not None and not filtered_df.empty else 0
+            
+            print(f"[metadata_processor_node] Filtering complete: {original_count} → {filtered_count} articles")
+            
+            # Replace original DataFrame with filtered results
+            metadata_df = filtered_df
+            
+            # Update cache/state with filtered DataFrame
+            if "cache_id" in metadata_payload:
+                # Update cache with filtered data
+                cache_id = metadata_payload.get("cache_id")
+                if cache_id and metadata_df is not None and not metadata_df.empty:
+                    # Recalculate source counts for filtered data
+                    filtered_source_counts = {}
+                    if 'source' in metadata_df.columns:
+                        filtered_source_counts = metadata_df['source'].value_counts().to_dict()
+                    
+                    # Update cache entry
+                    updated_metadata = {
+                        "records": metadata_df.to_dict(orient="records"),
+                        "columns": list(metadata_df.columns),
+                        "shape": list(metadata_df.shape),
+                        "dtypes": {col: str(dtype) for col, dtype in metadata_df.dtypes.items()},
+                        "source_counts": filtered_source_counts,
+                        "query": metadata_payload.get("query", ""),
+                        "sources": metadata_payload.get("sources", []),
+                        "start_date": metadata_payload.get("start_date", ""),
+                        "end_date": metadata_payload.get("end_date", ""),
+                        "generated_at": metadata_payload.get("generated_at", datetime.utcnow().isoformat()),
+                    }
+                    _metadata_cache[cache_id] = updated_metadata
+                    
+                    # Update state payload summary
+                    metadata_payload["summary"] = {
+                        "total_count": filtered_count,
+                        "columns": list(metadata_df.columns),
+                        "shape": list(metadata_df.shape),
+                        "sources": filtered_source_counts,
+                    }
+                    print(f"[metadata_processor_node] Updated cache entry: {cache_id}")
+            else:
+                # Update state directly with filtered data
+                if metadata_df is not None and not metadata_df.empty:
+                    filtered_source_counts = {}
+                    if 'source' in metadata_df.columns:
+                        filtered_source_counts = metadata_df['source'].value_counts().to_dict()
+                    
+                    metadata_payload = {
+                        "records": metadata_df.to_dict(orient="records"),
+                        "columns": list(metadata_df.columns),
+                        "shape": list(metadata_df.shape),
+                        "dtypes": {col: str(dtype) for col, dtype in metadata_df.dtypes.items()},
+                        "source_counts": filtered_source_counts,
+                        "query": metadata_payload.get("query", ""),
+                        "sources": metadata_payload.get("sources", []),
+                        "start_date": metadata_payload.get("start_date", ""),
+                        "end_date": metadata_payload.get("end_date", ""),
+                        "generated_at": metadata_payload.get("generated_at", datetime.utcnow().isoformat()),
+                    }
+                    print(f"[metadata_processor_node] Updated state with filtered data")
+            
+            # Print filtered DataFrame summary BEFORE parameter extraction
+            if metadata_df is not None and not metadata_df.empty:
+                print(f"\n{'='*80}")
+                print(f"[metadata_processor_node] Filtered DataFrame Summary:")
+                print(f"{'='*80}")
+                print(f"Shape: {metadata_df.shape[0]} rows × {metadata_df.shape[1]} columns")
+                print(f"\nColumns: {list(metadata_df.columns)}")
+                
+                # Print source breakdown if available
+                if 'source' in metadata_df.columns:
+                    source_counts = metadata_df['source'].value_counts()
+                    print(f"\nSource breakdown:")
+                    for source, count in source_counts.items():
+                        print(f"  - {source}: {count} articles")
+                
+                # Print growth factor breakdown if available
+                if 'Growth_Factor_Name' in metadata_df.columns:
+                    gf_counts = metadata_df['Growth_Factor_Name'].value_counts()
+                    print(f"\nGrowth Factor breakdown:")
+                    for gf, count in gf_counts.items():
+                        print(f"  - {gf}: {count} articles")
+                
+                # Print first few rows
+                print(f"\nFirst 5 rows:")
+                print(metadata_df.head().to_string())
+                
+                print(f"{'='*80}\n")
+            
+            # Extract parameters using LLM if not already extracted
+            if metadata_df is not None and not metadata_df.empty:
+                # Check if parameters already extracted
+                has_q1_column = "Q1_Protein_Production" in metadata_df.columns
+                q1_all_na = metadata_df["Q1_Protein_Production"].isna().all() if has_q1_column else True
+                q1_all_empty = (metadata_df["Q1_Protein_Production"] == "").all() if has_q1_column else True
+                
+                print(f"[metadata_processor_node] Parameter extraction check: has_q1_column={has_q1_column}, q1_all_na={q1_all_na}, q1_all_empty={q1_all_empty}")
+                
+                if not has_q1_column or q1_all_na or q1_all_empty:
+                    print(f"\n[metadata_processor_node] Starting LLM parameter extraction for {len(metadata_df)} articles...")
+                    try:
+                        # Extract parameters asynchronously
+                        metadata_df = await extract_parameters_from_dataframe(metadata_df, start_idx=0)
+                        print(f"[metadata_processor_node] Parameter extraction complete")
+                        
+                        # Update cache/state with extracted parameters
+                        if "cache_id" in metadata_payload:
+                            # Update cache with extracted data
+                            cache_id = metadata_payload.get("cache_id")
+                            if cache_id and metadata_df is not None and not metadata_df.empty:
+                                filtered_source_counts = {}
+                                if 'source' in metadata_df.columns:
+                                    filtered_source_counts = metadata_df['source'].value_counts().to_dict()
+                                
+                                # Update cache entry
+                                updated_metadata = {
+                                    "records": metadata_df.to_dict(orient="records"),
+                                    "columns": list(metadata_df.columns),
+                                    "shape": list(metadata_df.shape),
+                                    "dtypes": {col: str(dtype) for col, dtype in metadata_df.dtypes.items()},
+                                    "source_counts": filtered_source_counts,
+                                    "query": metadata_payload.get("query", ""),
+                                    "sources": metadata_payload.get("sources", []),
+                                    "start_date": metadata_payload.get("start_date", ""),
+                                    "end_date": metadata_payload.get("end_date", ""),
+                                    "generated_at": metadata_payload.get("generated_at", datetime.utcnow().isoformat()),
+                                }
+                                _metadata_cache[cache_id] = updated_metadata
+                                
+                                # Update state payload summary
+                                metadata_payload["summary"] = {
+                                    "total_count": len(metadata_df),
+                                    "columns": list(metadata_df.columns),
+                                    "shape": list(metadata_df.shape),
+                                    "sources": filtered_source_counts,
+                                }
+                                print(f"[metadata_processor_node] Updated cache entry with extracted parameters: {cache_id}")
+                        else:
+                            # Update state directly with extracted data
+                            if metadata_df is not None and not metadata_df.empty:
+                                filtered_source_counts = {}
+                                if 'source' in metadata_df.columns:
+                                    filtered_source_counts = metadata_df['source'].value_counts().to_dict()
+                                
+                                metadata_payload = {
+                                    "records": metadata_df.to_dict(orient="records"),
+                                    "columns": list(metadata_df.columns),
+                                    "shape": list(metadata_df.shape),
+                                    "dtypes": {col: str(dtype) for col, dtype in metadata_df.dtypes.items()},
+                                    "source_counts": filtered_source_counts,
+                                    "query": metadata_payload.get("query", ""),
+                                    "sources": metadata_payload.get("sources", []),
+                                    "start_date": metadata_payload.get("start_date", ""),
+                                    "end_date": metadata_payload.get("end_date", ""),
+                                    "generated_at": metadata_payload.get("generated_at", datetime.utcnow().isoformat()),
+                                }
+                                print(f"[metadata_processor_node] Updated state with extracted parameters")
+                    except Exception as e:
+                        print(f"[metadata_processor_node] Error during parameter extraction: {e}")
+                        import traceback
+                        traceback.print_exc()
+                else:
+                    print(f"[metadata_processor_node] Parameters already extracted, skipping LLM extraction")
+            
+            # Apply final filtering (Human + E. coli + Growth Factor Pattern Match)
+            if metadata_df is not None and not metadata_df.empty:
+                # Check if required columns exist for final filtering
+                required_cols = ['Q3_Recombinant_Proteins', 'Q4_Species', 'Q5_Host_Organism', 'Growth_Factor_Name']
+                has_required_cols = all(col in metadata_df.columns for col in required_cols)
+                
+                if has_required_cols:
+                    pre_final_count = len(metadata_df)
+                    print(f"\n[metadata_processor_node] Applying final filter (Human + E. coli + Growth Factor Pattern Match)...")
+                    print(f"[metadata_processor_node] Articles before final filter: {pre_final_count}")
+                    
+                    try:
+                        # Apply final filtering
+                        metadata_df = filter_human_ecoli_gf(metadata_df)
+                        final_count = len(metadata_df) if metadata_df is not None and not metadata_df.empty else 0
+                        print(f"[metadata_processor_node] Final filtering complete: {pre_final_count} → {final_count} articles")
+                        
+                        # Update cache/state with final filtered DataFrame
+                        if "cache_id" in metadata_payload:
+                            # Update cache with final filtered data
+                            cache_id = metadata_payload.get("cache_id")
+                            if cache_id and metadata_df is not None and not metadata_df.empty:
+                                final_source_counts = {}
+                                if 'source' in metadata_df.columns:
+                                    final_source_counts = metadata_df['source'].value_counts().to_dict()
+                                
+                                # Update cache entry
+                                updated_metadata = {
+                                    "records": metadata_df.to_dict(orient="records"),
+                                    "columns": list(metadata_df.columns),
+                                    "shape": list(metadata_df.shape),
+                                    "dtypes": {col: str(dtype) for col, dtype in metadata_df.dtypes.items()},
+                                    "source_counts": final_source_counts,
+                                    "query": metadata_payload.get("query", ""),
+                                    "sources": metadata_payload.get("sources", []),
+                                    "start_date": metadata_payload.get("start_date", ""),
+                                    "end_date": metadata_payload.get("end_date", ""),
+                                    "generated_at": metadata_payload.get("generated_at", datetime.utcnow().isoformat()),
+                                }
+                                _metadata_cache[cache_id] = updated_metadata
+                                
+                                # Update state payload summary
+                                metadata_payload["summary"] = {
+                                    "total_count": final_count,
+                                    "columns": list(metadata_df.columns),
+                                    "shape": list(metadata_df.shape),
+                                    "sources": final_source_counts,
+                                }
+                                print(f"[metadata_processor_node] Updated cache entry with final filtered data: {cache_id}")
+                        else:
+                            # Update state directly with final filtered data
+                            if metadata_df is not None and not metadata_df.empty:
+                                final_source_counts = {}
+                                if 'source' in metadata_df.columns:
+                                    final_source_counts = metadata_df['source'].value_counts().to_dict()
+                                
+                                metadata_payload = {
+                                    "records": metadata_df.to_dict(orient="records"),
+                                    "columns": list(metadata_df.columns),
+                                    "shape": list(metadata_df.shape),
+                                    "dtypes": {col: str(dtype) for col, dtype in metadata_df.dtypes.items()},
+                                    "source_counts": final_source_counts,
+                                    "query": metadata_payload.get("query", ""),
+                                    "sources": metadata_payload.get("sources", []),
+                                    "start_date": metadata_payload.get("start_date", ""),
+                                    "end_date": metadata_payload.get("end_date", ""),
+                                    "generated_at": metadata_payload.get("generated_at", datetime.utcnow().isoformat()),
+                                }
+                                print(f"[metadata_processor_node] Updated state with final filtered data")
+                    except Exception as e:
+                        print(f"[metadata_processor_node] Error during final filtering: {e}")
+                        import traceback
+                        traceback.print_exc()
+                else:
+                    missing_cols = [col for col in required_cols if col not in metadata_df.columns]
+                    print(f"[metadata_processor_node] Skipping final filter: missing required columns: {missing_cols}")
+            
+            # Print DataFrame information AFTER parameter extraction and final filtering
+            if metadata_df is not None and not metadata_df.empty:
+                print(f"\n{'='*80}")
+                print(f"[metadata_processor_node] Final DataFrame Summary (After All Processing):")
+                print(f"{'='*80}")
+                print(f"Shape: {metadata_df.shape[0]} rows × {metadata_df.shape[1]} columns")
+                print(f"\nColumns: {list(metadata_df.columns)}")
+                
+                # Print source breakdown if available
+                if 'source' in metadata_df.columns:
+                    source_counts = metadata_df['source'].value_counts()
+                    print(f"\nSource breakdown:")
+                    for source, count in source_counts.items():
+                        print(f"  - {source}: {count} articles")
+                
+                # Print growth factor breakdown if available
+                if 'Growth_Factor_Name' in metadata_df.columns:
+                    gf_counts = metadata_df['Growth_Factor_Name'].value_counts()
+                    print(f"\nGrowth Factor breakdown:")
+                    for gf, count in gf_counts.items():
+                        print(f"  - {gf}: {count} articles")
+                
+                # Print parameter extraction statistics if available
+                if 'Q1_Protein_Production' in metadata_df.columns:
+                    q1_counts = metadata_df['Q1_Protein_Production'].value_counts()
+                    print(f"\nParameter Extraction Statistics:")
+                    print(f"  - Total articles processed: {len(metadata_df)}")
+                    print(f"  - Q1_Protein_Production breakdown:")
+                    for value, count in q1_counts.items():
+                        if pd.notna(value) and str(value).strip():
+                            print(f"    - {value}: {count} articles")
+                
+                # Print final filter statistics if available
+                if 'Q4_Species' in metadata_df.columns and 'Q5_Host_Organism' in metadata_df.columns:
+                    print(f"\nFinal Filter Statistics:")
+                    if 'Q4_Species' in metadata_df.columns:
+                        species_counts = metadata_df['Q4_Species'].value_counts()
+                        print(f"  - Species breakdown:")
+                        for species, count in species_counts.items():
+                            if pd.notna(species) and str(species).strip():
+                                print(f"    - {species}: {count} articles")
+                    if 'Q5_Host_Organism' in metadata_df.columns:
+                        host_counts = metadata_df['Q5_Host_Organism'].value_counts()
+                        print(f"  - Host Organism breakdown:")
+                        for host, count in host_counts.items():
+                            if pd.notna(host) and str(host).strip():
+                                print(f"    - {host}: {count} articles")
+                
+                # Print data types
+                print(f"\nData types:")
+                print(metadata_df.dtypes.to_string())
+                
+                # Print sample of key columns if they exist (including extracted parameters)
+                key_columns = ['title', 'abstract', 'authors', 'journal', 'doi', 'publication_year', 'Growth_Factor_Name', 'Q1_Protein_Production', 'Q3_Recombinant_Proteins', 'Q4_Species', 'Q5_Host_Organism']
+                available_key_columns = [col for col in key_columns if col in metadata_df.columns]
+                if available_key_columns:
+                    print(f"\nSample data from key columns (including extracted parameters):")
+                    print(metadata_df[available_key_columns].head(3).to_string())
+                
+                print(f"{'='*80}\n")
+        else:
+            print("[metadata_processor_node] DataFrame is empty or None after filtering")
+        
+        # Return updated metadata payload to update state
+        return {"protein_metadata": metadata_payload}
+
     # Build workflow graph
     graph = StateGraph(WorkflowState)
     graph.add_node("entity_extraction", entity_extraction_node)
@@ -1177,6 +1770,8 @@ def build_workflow(llm_client: 'LLMClient', mcp: 'ProteinSearchClient'):
     graph.add_node("search_clarification", search_clarification_node)
     graph.add_node("select_node", select_node)
     graph.add_node("protein_details_node", protein_details_node)
+    graph.add_node("metadata_fetcher_node", metadata_fetcher_node)
+    graph.add_node("metadata_processor_node", metadata_processor_node)
 
     graph.add_edge(START, "entity_extraction")
 
@@ -1229,7 +1824,9 @@ def build_workflow(llm_client: 'LLMClient', mcp: 'ProteinSearchClient'):
     graph.add_edge("narrow_down_node", "search_clarification")
     graph.add_edge("search_clarification", "entity_extraction")  # Loop back to extraction to re-process refinement
     graph.add_edge("select_node", "protein_details_node")  # Go to details after selection
-    graph.add_edge("protein_details_node", END)
+    graph.add_edge("protein_details_node", "metadata_fetcher_node")  # Fetch metadata after details
+    graph.add_edge("metadata_fetcher_node", "metadata_processor_node")  # Process metadata (read from cache/state)
+    graph.add_edge("metadata_processor_node", END)  # End after processing
 
     # Compile with checkpointer for persistent state
     checkpointer = MemorySaver()
@@ -1499,7 +2096,7 @@ def _build_narrow_prompt(
 # MAIN FLOW
 # ============================================================================
 
-async def process(llm: LLMClient, mcp: ProteinSearchClient, user_message: str, thread_id: str = "default", workflow=None):
+async def process(llm: LLMClient, mcp: ProteinSearchClient, user_message: str, thread_id: str, workflow=None):
     """Process user message through the dynamic workflow with human-in-loop nodes.
     
     State is persisted automatically via the checkpointer, so no state parameter needed.
@@ -1514,6 +2111,9 @@ async def process(llm: LLMClient, mcp: ProteinSearchClient, user_message: str, t
     # Check for exit command - reset by using a new thread_id
     if user_message.lower() in ['exit', 'quit', 'restart', 'reset']:
         print(f"[DECISION] Restarting conversation")
+        # Cleanup metadata cache for this thread before resetting
+        if thread_id:
+            cleanup_metadata_cache(thread_id)
         # Generate a new thread_id to clear state (checkpointer stores state per thread_id)
         new_thread_id = f"reset-{int(time.time())}"
         print(f"[STATE RESET] Using new thread_id: {new_thread_id}")
@@ -1553,7 +2153,7 @@ async def process(llm: LLMClient, mcp: ProteinSearchClient, user_message: str, t
     # Always check for pending interrupts (regardless of reset status)
     try:
         current_state = workflow.get_state(config)
-        if current_state:
+        if current_state:   # State exists for this thread_id
             if current_state.tasks:
                 # Check if there's a pending interrupt - workflow is waiting for user input
                 for task in current_state.tasks:
@@ -1572,6 +2172,9 @@ async def process(llm: LLMClient, mcp: ProteinSearchClient, user_message: str, t
                     # Check if previous workflow ended (no tasks, but state exists)
                     # This means workflow reached END - start fresh for new conversation
                     should_start_fresh = True
+                    # Cleanup metadata cache when conversation ends
+                    if thread_id:
+                        cleanup_metadata_cache(thread_id)
                     print("[WORKFLOW] Previous workflow ended - starting fresh conversation")
         else:
             # No saved state - fresh start
@@ -1607,6 +2210,7 @@ async def process(llm: LLMClient, mcp: ProteinSearchClient, user_message: str, t
             "retry_alternate_index": 0,
             "assistant_message": None,
             "clarification_message": None,
+            "protein_metadata": None,
         }
         print("[WORKFLOW] Running fresh workflow invocation with clean state...")
         result = await workflow.ainvoke(workflow_state, config=config)
@@ -1700,6 +2304,48 @@ async def process(llm: LLMClient, mcp: ProteinSearchClient, user_message: str, t
     print(f"{'='*80}\n")
     
     # Return both the message and workflow details for API service
+    # Convert metadata payload to summary for API response
+    metadata_payload = result.get("protein_metadata")
+    metadata_summary = None
+    if metadata_payload:
+        try:
+            # Check if metadata is stored in cache (large dataset)
+            if "cache_id" in metadata_payload:
+                # Large dataset - use summary from payload
+                cache_id = metadata_payload.get("cache_id")
+                summary = metadata_payload.get("summary", {})
+                
+                # Register cache_id with thread_id for cleanup
+                if thread_id and cache_id:
+                    register_cache_for_thread(thread_id, cache_id)
+                
+                metadata_summary = {
+                    "total_count": summary.get("total_count", 0),
+                    "columns": summary.get("columns", []),
+                    "shape": summary.get("shape", [0, 0]),
+                    "sources": summary.get("sources", {}),
+                    "cache_id": cache_id,  # Include cache_id in response for reference
+                }
+            else:
+                # Small dataset - data is in state
+                total_count = metadata_payload.get("shape", [0, 0])[0]
+                if not total_count and metadata_payload.get("records"):
+                    total_count = len(metadata_payload.get("records", []))
+                metadata_summary = {
+                    "total_count": total_count,
+                    "columns": metadata_payload.get("columns", []),
+                    "shape": metadata_payload.get("shape", [total_count, len(metadata_payload.get("columns", []))]),
+                    "sources": metadata_payload.get("source_counts", {}),
+                }
+        except Exception as e:
+            print(f"[process] Error creating metadata summary: {e}")
+            metadata_summary = {
+                "total_count": 0,
+                "columns": [],
+                "shape": [0, 0],
+                "sources": {}
+            }
+    
     workflow_details = {
         "protein_name": result.get("protein_name"),
         "organism": result.get("organism"),
@@ -1708,6 +2354,7 @@ async def process(llm: LLMClient, mcp: ProteinSearchClient, user_message: str, t
         "applied_filters": result.get("applied_filters", {}),
         "search_attempts": len(result.get("search_attempts", [])),
         "retry_count": result.get("retry_count", 0),
+        "protein_metadata": metadata_summary,  # Summary only for API (DataFrame stays in state)
     }
     
     return final_message or "", workflow_details
