@@ -23,7 +23,6 @@ from langgraph.graph.message import add_messages
 from langgraph.types import interrupt, Command
 import pandas as pd
 from protein_search_client import ProteinSearchClient
-from organism_resolver import OrganismResolver
 from search_agent import SearchAgent
 from external_apis import fetch_metadata
 from scripts.filter1 import filter_growth_factors
@@ -457,6 +456,7 @@ class WorkflowState(TypedDict):
     # extracted entities
     protein_name: Optional[str]
     organism: Optional[str]
+    protein_accession: Optional[str]
     # search and results
     protein_results: List[Any]
     selected_protein: Optional[Any]
@@ -629,7 +629,6 @@ def build_workflow(llm_client: 'LLMClient', mcp: 'ProteinSearchClient'):
         return "\n".join(f"{m.get('role', '')}: {m.get('content', '')}" for m in history)
 
     search_agent = SearchAgent(mcp)
-    organism_resolver = OrganismResolver(mcp)
 
     def entity_extraction_node(state: WorkflowState) -> Dict[str, Any]:
         """Extract entities from current user message only."""
@@ -648,10 +647,13 @@ def build_workflow(llm_client: 'LLMClient', mcp: 'ProteinSearchClient'):
     - chat_history: {list(state.get("chat_history", []))}
 
     CRITICAL INSTRUCTIONS:
-    - DO not include fields in the response that are not mentioned in the user's message.
-    - Use chat_history to understand the user's intent and context.
+    - If protein_name & organism are already set,
+        - The user is mostly providing refinement terms, so extract the refinement terms.
+        - Map abbreviations or short terms to the most relevant refinement entity (e.g., gene_symbols).
+    - Use the last message in chat_history to understand if the user is replying to previous assistant message or not. for example, last assistant message may ask the user to provide specific gene symbol or other refinement terms, and the user input is that. you have to correctly identify it.
 
     Extract any of these entities if present from the user's message:
+    - accession: UniProt accession number (e.g., "P01308", "Q99999")
     - protein_name: Protein/gene name (e.g., "EGFR", "p53", "Angiopoietin-1")
     - organism: Species (e.g., "human", "mouse", "Homo sapiens")
     - gene_symbols: Specific gene symbols (e.g., ["LIF", "ANGPT1"])
@@ -733,6 +735,7 @@ def build_workflow(llm_client: 'LLMClient', mcp: 'ProteinSearchClient'):
         # Parse extracted entities
         protein = None
         org = None
+        accession = None
         refinements = {}
         
         if json_str:
@@ -745,6 +748,9 @@ def build_workflow(llm_client: 'LLMClient', mcp: 'ProteinSearchClient'):
                 
                 if extracted.get("organism"):
                     org = _normalize_organism_name(extracted["organism"].strip())
+
+                if extracted.get("accession"):
+                    accession = extracted["accession"].strip()
                 
                 # Extract refinements - check both nested and top-level
                 extracted_refs = extracted.get("refinements", {})
@@ -807,12 +813,20 @@ def build_workflow(llm_client: 'LLMClient', mcp: 'ProteinSearchClient'):
                 print(f"[entity_extraction] JSON parse error: {e}")
                 print(f"[entity_extraction] Attempted: {json_str[:200]}")
         
+        # Fallback: regex detect accession if not provided
+        if accession is None:
+            accession_match = re.search(r"\b(?:[OPQ][0-9][A-Z0-9]{3}[0-9]|[A-NR-Z][0-9]{5})\b", user_message, re.IGNORECASE)
+            if accession_match:
+                accession = accession_match.group(0)
+        
         # Build summary
         summary_parts = []
         if protein:
             summary_parts.append(f"protein={protein}")
         if org:
             summary_parts.append(f"organism={org}")
+        if accession:
+            summary_parts.append(f"accession={accession}")
         if refinements:
             summary_parts.append(f"refinements={list(refinements.keys())}")
         
@@ -832,6 +846,9 @@ def build_workflow(llm_client: 'LLMClient', mcp: 'ProteinSearchClient'):
         # Only include organism if it was extracted (not None)
         if org is not None:
             update_dict["organism"] = org
+
+        if accession is not None:
+            update_dict["protein_accession"] = accession
         
         # Merge refinements: preserve existing refinements and only update new ones
         existing_refinements = state.get("refinement_terms", {})
@@ -847,7 +864,8 @@ def build_workflow(llm_client: 'LLMClient', mcp: 'ProteinSearchClient'):
         print("\n[entity_clarification] Requesting missing information from user...")
         missing: List[str] = []
         if not state.get("protein_name"):
-            missing.append("protein name (gene symbol, protein name, or UniProt accession)")
+            if not state.get("protein_accession"):
+                missing.append("protein name (gene symbol, protein name, or UniProt accession)")
         if not state.get("organism"):
             missing.append("organism (e.g., Homo sapiens, Mus musculus)")
         message = f"Please provide: {', '.join(missing)}"
@@ -873,31 +891,27 @@ def build_workflow(llm_client: 'LLMClient', mcp: 'ProteinSearchClient'):
     async def dynamic_search_node(state: WorkflowState) -> Dict[str, Any]:
         print("\n[dynamic_search] Building query from structured refinements...")
         
+        accession = state.get("protein_accession")
         protein = state.get("protein_name") or ""
         organism = state.get("organism")
         refinement_terms = state.get("refinement_terms", {})
         
-        # Resolve organism taxonomy
-        if organism:
-            resolved_org = await organism_resolver.resolve(organism)
-            if resolved_org:
-                organism = resolved_org.get("label")
-                # Add taxonomy to filters for summary
-                refinement_terms = dict(refinement_terms)
-                refinement_terms["organism_taxonomy"] = resolved_org
-        
-        # Build query using simple helper
-        search_query, filters_text = _build_query_from_refinements(
-            protein_name=protein,
-            organism=organism,
-            refinement_terms=refinement_terms
-        )
+        if accession:
+            search_query = accession
+            filters_text = f"accession: {accession}"
+        else:
+            # Build query using simple helper (MCP server will resolve organism taxonomy)
+            search_query, filters_text = _build_query_from_refinements(
+                protein_name=protein,
+                organism=organism,
+                refinement_terms=refinement_terms
+            )
         
         print(f"[dynamic_search] Query: {search_query}")
         print(f"[dynamic_search] Filters: {filters_text}")
         
         # Execute search
-        outcome = await search_agent.search(search_query, organism=organism, size=100)
+        outcome = await search_agent.search(search_query, size=100)
         
         for step in outcome.steps:
             print(f"[search_agent] tool={step.tool} hits={step.hits} query='{step.query}'")
@@ -908,10 +922,13 @@ def build_workflow(llm_client: 'LLMClient', mcp: 'ProteinSearchClient'):
         facets = _summarize_facets(results)
         
         # Record attempt
+        filters_used = {"protein": protein, "organism": organism, "refinements": refinement_terms}
+        if accession:
+            filters_used["accession"] = accession
         attempt_record = {
             "query": effective_query,
             "result_count": count,
-            "filters": {"protein": protein, "organism": organism, "refinements": refinement_terms},
+            "filters": filters_used,
             "steps": [step.__dict__ for step in outcome.steps],
         }
         attempts = _update_attempt_history(state.get("search_attempts", []), attempt_record)
@@ -924,10 +941,13 @@ def build_workflow(llm_client: 'LLMClient', mcp: 'ProteinSearchClient'):
             summary_parts.append(f"top organism: {facets['organisms'][0]}")
         summary = " | ".join(summary_parts)
         
+        applied_filters = {"protein": protein, "organism": organism, **refinement_terms}
+        if accession:
+            applied_filters["accession"] = accession
         return {
             "protein_results": results,
             "optimized_query": effective_query,
-            "applied_filters": {"protein": protein, "organism": organism, **refinement_terms},
+            "applied_filters": applied_filters,
             "search_facets": facets,
             "search_attempts": attempts,
             "filter_summary_text": filters_text,
@@ -1777,7 +1797,7 @@ def build_workflow(llm_client: 'LLMClient', mcp: 'ProteinSearchClient'):
 
     # Conditional transitions
     def route_from_extraction(state: WorkflowState) -> str:
-        if state.get("protein_name") and state.get("organism"):
+        if state.get("protein_accession") or (state.get("protein_name") and state.get("organism")):
             return "dynamic_search"
         return "entity_clarification"
 
@@ -2196,6 +2216,7 @@ async def process(llm: LLMClient, mcp: ProteinSearchClient, user_message: str, t
             "query": user_message,
             "protein_name": None,
             "organism": None,
+            "protein_accession": None,
             "protein_results": [],
             "selected_protein": None,
             "refinement_terms": {},
