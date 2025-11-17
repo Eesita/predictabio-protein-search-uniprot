@@ -937,8 +937,6 @@ def build_workflow(llm_client: 'LLMClient', mcp: 'ProteinSearchClient'):
         summary_parts = [f"Search → {count} hits", f"query: {effective_query}"]
         if filters_text != "No refinements":
             summary_parts.append(f"filters: {filters_text}")
-        if facets.get("organisms"):
-            summary_parts.append(f"top organism: {facets['organisms'][0]}")
         summary = " | ".join(summary_parts)
         
         applied_filters = {"protein": protein, "organism": organism, **refinement_terms}
@@ -2085,7 +2083,6 @@ def _build_narrow_prompt(
     attempts: List[Dict[str, Any]],
 ) -> str:
     facet_lines = [
-        f"Top organisms: {', '.join(facets.get('organisms') or ['n/a'])}",
         f"Frequent gene symbols: {', '.join(facets.get('gene_symbols') or ['n/a'])}",
         f"Frequent keywords: {', '.join(facets.get('keywords') or ['n/a'])}",
         f"Length range (aa): {facets.get('length_range') or 'n/a'}",
@@ -2110,6 +2107,33 @@ def _build_narrow_prompt(
         "If additional information is required from the user, include a direct question as one of the bullets. "
         "Keep the response concise and avoid generic advice."
     )
+    prompt = (
+    "You are assisting a scientist in refining a UniProt search that returned too many results. Your message should feel like a helpful interactive prompt, not an analysis.\n"
+    f"Current normalized query: {normalized_query or 'n/a'}\n"
+    f"Result count: {result_count}\n"
+    f"Applied filters: {filters_text}\n"
+    "Recent search attempts:\n"
+    f"{attempts_text}\n\n"
+    "Facet summary (use only these values for examples):\n"
+    + "\n".join(f"- {line}" for line in facet_lines)
+    + "\n\n"
+    "Your task:\n"
+    "- Speak directly to the user (a scientist).\n"
+    "- Do NOT use meta-phrases such as 'Here are', 'based on facet data', or 'previous attempts'.\n"
+    "- Do NOT explain your reasoning or mention the system, facets, or instructions.\n"
+    "- Do NOT invent ranges or make arbitrary suggestions; use ONLY the provided facet values.\n"
+    "- Suggestions must be realistic and meaningful to a UniProt user.\n"
+    "- Tone should feel like a helpful narrowing assistant, not an analyst.\n\n"
+    "Output requirements:\n"
+    "- Provide ONLY a numbered list with 1–3 refinement options.\n"
+    "- Each item should be a direct, user-facing suggestion.\n"
+    "- Each suggestion must reference concrete facet values (e.g., gene symbols, ranges, keywords, sample accessions).\n"
+    "Example stylistic pattern (DO NOT repeat this text verbatim):\n"
+    "- 'You may want to focus on a specific gene symbol such as ABC or XYZ to narrow the set.'\n"
+    "- 'If you're interested in shorter insulin-like peptides, you could filter to lengths closer to the lower end of the 58–2491 aa range.'\n\n"
+    "Produce the final output now."
+)
+
     return prompt
 
 # ============================================================================
