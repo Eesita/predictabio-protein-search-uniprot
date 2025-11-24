@@ -122,8 +122,6 @@ Length: 393 aa"
 
 ## Related Documentation
 
-- [USER_GUIDE.md](USER_GUIDE.md) - End-user guide for using the system
-- [WORKFLOW_DOCUMENTATION.md](WORKFLOW_DOCUMENTATION.md) - Technical documentation of nodes and architecture
 - [README.md](README.md) - Project setup and quick start guide
 - [DEPLOYMENT.md](DEPLOYMENT.md) - Deployment instructions
 
