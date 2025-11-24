@@ -623,11 +623,6 @@ async def log_langsmith_evaluation(
 def build_workflow(llm_client: 'LLMClient', mcp: 'ProteinSearchClient'):
     """Create LangGraph workflow covering extraction, search, refinement, selection, and details."""
 
-    def _history_to_str(history: List[Dict[str, str]]) -> str:
-        if not history:
-            return "No previous conversation"
-        return "\n".join(f"{m.get('role', '')}: {m.get('content', '')}" for m in history)
-
     search_agent = SearchAgent(mcp)
 
     def entity_extraction_node(state: WorkflowState) -> Dict[str, Any]:
@@ -1215,57 +1210,16 @@ def build_workflow(llm_client: 'LLMClient', mcp: 'ProteinSearchClient'):
         selected = state.get("selected_protein")
         if not selected:
             return {}
-        base_query = (state.get("applied_filters") or {}).get("base_query")
-        gene_symbols = (state.get("applied_filters") or {}).get("gene_symbols", [])
-        name_lower = getattr(selected, "name", "").lower()
-        if base_query and base_query.lower() not in name_lower:
-            message = (
-                f"Selected protein {getattr(selected, 'accession', '')} does not appear to match the target '{base_query}'. "
-                "Please choose another option or refine the query."
-            )
-            history = list(state.get("chat_history", []))
-            history.append({"role": "assistant", "content": message})
-            # Validation failed - use interrupt to ask user to select again
-            user_selection = interrupt(message)
-            # If user provides new selection, update query and let workflow continue
-            if user_selection:
-                return {
-                    "query": user_selection.strip(),
-                    "assistant_message": message,
-                    "chat_history": history,
-                }
-            return {
-                "assistant_message": message,
-                "chat_history": history,
-            }
-        if gene_symbols:
-            accession_genes = [g.lower() for g in getattr(selected, "gene_names", []) or []]
-            if accession_genes and not any(gs.lower() in accession_genes for gs in gene_symbols):
-                message = (
-                    f"Selected protein {getattr(selected, 'accession', '')} lacks the expected gene symbol ({', '.join(gene_symbols)}). "
-                    "Please choose another option or refine the query."
-                )
-                history = list(state.get("chat_history", []))
-                history.append({"role": "assistant", "content": message})
-                # Validation failed - use interrupt to ask user to select again
-                user_selection = interrupt(message)
-                # If user provides new selection, update query and let workflow continue
-                if user_selection:
-                    return {
-                        "query": user_selection.strip(),
-                        "assistant_message": message,
-                        "chat_history": history,
-                    }
-                return {
-                    "assistant_message": message,
-                    "chat_history": history,
-                }
+        
+        # Enrich protein details by re-querying UniProt
         accession = getattr(selected, "accession", None) or ""
         details = selected
         if accession:
             enriched = await mcp.search_proteins(query=accession, organism=None, size=1)
             if enriched:
                 details = enriched[0]
+        
+        # Format protein details for display
         fields = [
             f"Accession: {getattr(details, 'accession', '')}",
             f"Name: {getattr(details, 'name', '')}",
