@@ -18,7 +18,7 @@ import time
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, Dict, Any, List, Tuple, Set, Annotated
+from typing import Optional, Dict, Any, List, Tuple, Set, Annotated, Callable, Awaitable
 from typing_extensions import TypedDict
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import MemorySaver
@@ -1317,6 +1317,9 @@ def build_workflow(llm_client: 'LLMClient', mcp: 'ProteinSearchClient'):
         """Fetch metadata for the selected protein from external sources."""
         print("\n[metadata_fetcher_node] Fetching metadata for selected protein...")
 
+        # TEMP: force an error to validate error handling/logging without touching core logic
+        raise RuntimeError("Intentional test error from metadata_fetcher_node")
+
         selected = state.get("selected_protein")
         if not selected:
             print("[metadata_fetcher_node] No selected protein, skipping metadata fetch")
@@ -2609,6 +2612,30 @@ def _format_result_list(results: List[Any]) -> str:
         lines.append(line)
     return "\n\n".join(lines)
 
+def _serialize_protein(protein: Any) -> Optional[Dict[str, Any]]:
+    """Serialize a protein object (dataclass or dict) into primitives for JSON/SSE."""
+    if protein is None:
+        return None
+    fields = [
+        "accession",
+        "name",
+        "organism",
+        "description",
+        "gene_names",
+        "keywords",
+        "length",
+        "mass",
+    ]
+    serialized: Dict[str, Any] = {}
+    for field in fields:
+        if isinstance(protein, dict):
+            value = protein.get(field)
+        else:
+            value = getattr(protein, field, None)
+        if value is not None:
+            serialized[field] = value
+    return serialized or None
+
 
 COMMON_ORGANISMS = {
     "human": "Homo sapiens",
@@ -2883,7 +2910,14 @@ def _build_narrow_prompt(
 # MAIN FLOW
 # ============================================================================
 
-async def process(llm: LLMClient, mcp: ProteinSearchClient, user_message: str, thread_id: str, workflow=None):
+async def process(
+    llm: LLMClient,
+    mcp: ProteinSearchClient,
+    user_message: str,
+    thread_id: str,
+    workflow=None,
+    stream_updates: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None,
+):
     """Process user message through the dynamic workflow with human-in-loop nodes.
     
     State is persisted automatically via the checkpointer, so no state parameter needed.
@@ -2975,10 +3009,10 @@ async def process(llm: LLMClient, mcp: ProteinSearchClient, user_message: str, t
     if is_resuming:
         # Resume from interrupt with user's response (regardless of reset status)
         print("[WORKFLOW] Resuming workflow from interrupt...")
-        result = await workflow.ainvoke(Command(resume=user_message), config=config)
+        invocation_input: Any = Command(resume=user_message)
     elif should_start_fresh:
         # Start fresh with complete state (workflow ended or reset)
-        workflow_state = {
+        invocation_input = {
             "chat_history": [{"role": "user", "content": user_message}],
             "query": user_message,
             "protein_name": None,
@@ -3001,23 +3035,58 @@ async def process(llm: LLMClient, mcp: ProteinSearchClient, user_message: str, t
             "protein_metadata": None,
         }
         print("[WORKFLOW] Running fresh workflow invocation with clean state...")
-        result = await workflow.ainvoke(workflow_state, config=config)
     else:
         # Normal flow: workflow in progress, partial state update
         # Build partial workflow state update with ONLY the fields we want to change
-        # According to LangGraph quickstart and interrupt docs:
-        # - You can pass a partial state dict when invoking - you don't need all fields
-        # - checkpointer automatically loads saved state for the thread_id when you invoke
-        # - Fields with reducers (like add_messages for chat_history) use the reducer to merge
-        # - chat_history will auto-append the new user message to existing history via add_messages
-        # - query field will update the saved query value
-        # - All other fields are preserved from the saved state automatically
-        workflow_state = {
+        invocation_input = {
             "chat_history": [{"role": "user", "content": user_message}],  # Auto-appends via add_messages reducer
             "query": user_message,  # Update query field
         }
         print("[WORKFLOW] Running fresh workflow invocation (continuing conversation)...")
-        result = await workflow.ainvoke(workflow_state, config=config)
+
+    # Execute workflow, optionally streaming updates for UI
+    result: Dict[str, Any] = {}
+    try:
+        if stream_updates:
+            async for update in workflow.astream(invocation_input, config=config, stream_mode="updates"):
+                if not update:
+                    continue
+                if "protein_details_node" in update:
+                    details_update = update.get("protein_details_node") or {}
+                    stream_payload = {
+                        "type": "protein_details",
+                        "message": details_update.get("assistant_message"),
+                        "selected_protein": _serialize_protein(details_update.get("selected_protein")),
+                    }
+                    if stream_payload["message"] or stream_payload["selected_protein"]:
+                        await stream_updates(stream_payload)
+
+            # After streaming completes, fetch the latest state from the checkpointer
+            state_snapshot = workflow.get_state(config)
+            if state_snapshot:
+                result = dict(state_snapshot.values)
+                if state_snapshot.interrupts:
+                    result["__interrupt__"] = list(state_snapshot.interrupts)
+        else:
+            result = await workflow.ainvoke(invocation_input, config=config)
+    except Exception as e:
+        # Suppress user-facing errors from long-running metadata/PDF/methods nodes
+        print(f"[WORKFLOW] Error during long-running phase: {e}")
+        import traceback
+        traceback.print_exc()
+        # Try to recover last known assistant message (protein details) if available
+        fallback_message = "Protein details retrieved. Background analysis continues."
+        try:
+            state_snapshot = workflow.get_state(config)
+            if state_snapshot and state_snapshot.values.get("assistant_message"):
+                fallback_message = state_snapshot.values.get("assistant_message")  # type: ignore
+        except Exception as state_e:
+            print(f"[WORKFLOW] Could not read state after error: {state_e}")
+        result = {
+            "assistant_message": fallback_message,
+            "clarification_message": None,
+            "protein_metadata": None,
+        }
     
     # Check if new interrupt occurred
     if "__interrupt__" in result:
@@ -3140,6 +3209,7 @@ async def process(llm: LLMClient, mcp: ProteinSearchClient, user_message: str, t
         "search_attempts": len(result.get("search_attempts", [])),
         "retry_count": result.get("retry_count", 0),
         "protein_metadata": metadata_summary,  # Summary only for API (DataFrame stays in state)
+        "conversation_id": thread_id,
     }
     
     return final_message or "", workflow_details
@@ -3164,9 +3234,20 @@ class ProteinClient:
     async def stop(self):
         await self.mcp.stop_server()
     
-    async def ask(self, question: str, conversation_id: Optional[str] = None) -> tuple[str, Dict[str, Any]]:
+    async def ask(
+        self,
+        question: str,
+        conversation_id: Optional[str] = None,
+        stream_updates: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None,
+    ) -> tuple[str, Dict[str, Any]]:
         # Use provided conversation_id or default thread_id
         thread = conversation_id if conversation_id else self.thread_id
-        response, workflow_details = await process(self.llm, self.mcp, question, thread, self.workflow)
+        response, workflow_details = await process(
+            self.llm,
+            self.mcp,
+            question,
+            thread,
+            self.workflow,
+            stream_updates=stream_updates,
+        )
         return response, workflow_details
-

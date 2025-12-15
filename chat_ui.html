@@ -420,6 +420,7 @@
         let conversationHistory = [];
         let currentSessionId = null;
         let currentConversationId = null;  // Track conversation_id for state persistence
+        let lastAssistantMessage = null;    // Track last rendered assistant message to avoid duplicates
         
         function generateSessionId() {
             return 'session_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
@@ -447,6 +448,7 @@
         async function sendMessage() {
             const message = chatInput.value.trim();
             if (!message || isTyping) return;
+            lastAssistantMessage = null;  // Reset for this turn
             
             // Create session ID if starting new conversation
             if (!currentSessionId) {
@@ -466,7 +468,7 @@
             showTypingIndicator();
             
             try {
-                const response = await fetch(`${API_BASE}/query`, {
+                const response = await fetch(`${API_BASE}/query/stream`, {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json',
@@ -477,43 +479,82 @@
                     })
                 });
                 
-                if (!response.ok) {
+                if (!response.ok || !response.body) {
                     throw new Error(`HTTP ${response.status}: ${response.statusText}`);
                 }
-                
-                const data = await response.json();
-                
-                // Update conversation_id from response (important for exit command which returns new ID)
-                if (data.conversation_id) {
-                    currentConversationId = data.conversation_id;
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder();
+                let buffer = '';
+                let finalPayload = null;
+
+                const handlePayload = async (payload) => {
+                    if (payload.type === 'protein_details' && payload.message) {
+                        addMessage('assistant', payload.message);
+                    } else if (payload.type === 'final') {
+                        finalPayload = payload;
+                        if (payload.conversation_id) {
+                            currentConversationId = payload.conversation_id;
+                        }
+
+                        hideTypingIndicator();
+
+                        // Only render final message if it's different AND not a duplicate protein details header
+                        const finalText = payload.response || 'No response available.';
+                        const isProteinDetails = finalText.trim().startsWith('Confirmed protein details:');
+                        const alreadyShownDetails = lastAssistantMessage && lastAssistantMessage.trim().startsWith('Confirmed protein details:');
+                        if (finalText !== lastAssistantMessage && !(isProteinDetails && alreadyShownDetails)) {
+                            addMessage('assistant', finalText);
+                        }
+
+                        // Store conversation history with workflow details
+                        conversationHistory.push({
+                            role: 'user', 
+                            content: message,
+                            workflow_details: payload.workflow_details || {}
+                        });
+                        conversationHistory.push({
+                            role: 'assistant', 
+                            content: payload.response || '',
+                            workflow_details: payload.workflow_details || {}
+                        });
+
+                        // Check if user wants to exit - run evaluation on complete conversation
+                        if (message.toLowerCase() === 'exit') {
+                            await evaluateCompleteConversation();
+                        }
+
+                        // Update status
+                        updateStatus('connected');
+                    } else if (payload.type === 'error') {
+                        throw new Error(payload.message || 'Streaming error');
+                    }
+                };
+
+                while (true) {
+                    const { value, done } = await reader.read();
+                    if (done) break;
+                    
+                    buffer += decoder.decode(value, { stream: true });
+                    const chunks = buffer.split('\n\n');
+                    buffer = chunks.pop() || '';
+                    
+                    for (const chunk of chunks) {
+                        const line = chunk.trim();
+                        if (!line.startsWith('data:')) continue;
+                        const payload = JSON.parse(line.replace(/^data:\s*/, ''));
+                        await handlePayload(payload);
+                    }
                 }
-                
-                // Hide typing indicator
-                hideTypingIndicator();
-                
-                // Add assistant response
-                addMessage('assistant', data.response);
-                
-                // Store conversation history with workflow details
-                conversationHistory.push({
-                    role: 'user', 
-                    content: message,
-                    workflow_details: data.workflow_details || {}
-                });
-                conversationHistory.push({
-                    role: 'assistant', 
-                    content: data.response,
-                    workflow_details: data.workflow_details || {}
-                });
-                
-                // Check if user wants to exit - run evaluation on complete conversation
-                if (message.toLowerCase() === 'exit') {
-                    await evaluateCompleteConversation();
-                    // After exit, currentConversationId is already updated from response above
+
+                // Process any remaining buffered data after stream closes
+                if (buffer.trim().length > 0) {
+                    const payload = JSON.parse(buffer.replace(/^data:\s*/, '').trim());
+                    await handlePayload(payload);
                 }
-                
-                // Update status
-                updateStatus('connected');
+
+                if (!finalPayload) {
+                    throw new Error('No final response received from stream.');
+                }
                 
             } catch (error) {
                 console.error('Chat error:', error);
@@ -673,6 +714,10 @@
             
             chatMessages.appendChild(messageDiv);
             chatMessages.scrollTop = chatMessages.scrollHeight;
+            
+            if (sender === 'assistant') {
+                lastAssistantMessage = content;
+            }
         }
         
         function showTypingIndicator() {

@@ -3,12 +3,14 @@
 FastAPI microservice for conversational protein search
 """
 
+import asyncio
+import json
 import os
 from datetime import datetime
 from typing import Dict, Any, Optional, List
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 from conversational_protein_client import ProteinClient
 
@@ -97,6 +99,55 @@ async def process_query(request: QueryRequest) -> QueryResponse:
         print(f"[api_service] Error processing query: {e}")
         print(f"[api_service] Traceback: {error_trace}")
         raise HTTPException(status_code=500, detail=f"Error processing query: {str(e)}")
+
+
+@app.post("/query/stream")
+async def process_query_stream(request: QueryRequest):
+    """
+    Stream workflow updates so the UI can show protein details as soon as they are ready.
+    """
+    if not conversational_client:
+        raise HTTPException(status_code=503, detail="Service not available")
+
+    async def event_generator():
+        queue: asyncio.Queue[Optional[Dict[str, Any]]] = asyncio.Queue()
+
+        async def handle_update(update: Dict[str, Any]):
+            await queue.put(update)
+
+        async def run_workflow():
+            try:
+                response, workflow_details = await conversational_client.ask(
+                    request.query,
+                    conversation_id=request.conversation_id,
+                    stream_updates=handle_update,
+                )
+                await queue.put(
+                    {
+                        "type": "final",
+                        "response": response,
+                        "workflow_details": workflow_details,
+                        "conversation_id": workflow_details.get("new_conversation_id")
+                        or workflow_details.get("conversation_id")
+                        or request.conversation_id,
+                    }
+                )
+            except Exception as e:
+                await queue.put({"type": "error", "message": str(e)})
+            finally:
+                await queue.put(None)
+
+        worker = asyncio.create_task(run_workflow())
+        try:
+            while True:
+                item = await queue.get()
+                if item is None:
+                    break
+                yield f"data: {json.dumps(item)}\n\n"
+        finally:
+            await worker
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 class EvalRequest(BaseModel):
     question: str
