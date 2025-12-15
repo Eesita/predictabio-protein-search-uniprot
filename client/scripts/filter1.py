@@ -11,64 +11,13 @@ from typing import List, Tuple
 # Hardcoded growth factors with regex patterns
 # Format: (growth_factor_name, regex_pattern)
 GROWTH_FACTORS: List[Tuple[str, str]] = [
-    # Insulin
-    ("Insulin", r'\binsulin\b|INS\b'),
     
-    # Insulin-like Growth Factors
-    ("IGF-1", r'\bIGF-?1\b|insulin-like growth factor-?1\b|somatomedin-?C\b'),
-    ("IGF-2", r'\bIGF-?2\b|insulin-like growth factor-?2\b|somatomedin-?A\b'),
-    
-    # Epidermal Growth Factor
-    ("EGF", r'\bEGF\b|epidermal growth factor\b'),
-    
-    # Fibroblast Growth Factors
-    ("FGF", r'\bFGF-?\d+\b|fibroblast growth factor-?\d*\b'),
-    
-    # Platelet-Derived Growth Factor
-    ("PDGF", r'\bPDGF-?[AB]?\b|platelet-?derived growth factor\b'),
-    
-    # Vascular Endothelial Growth Factor
-    ("VEGF", r'\bVEGF-?[A-Z]?\b|vascular endothelial growth factor\b'),
-    
-    # Nerve Growth Factor
-    ("NGF", r'\bNGF\b|nerve growth factor\b'),
-    
-    # Transforming Growth Factor
-    ("TGF-β", r'\bTGF-?[βbeta]\b|transforming growth factor-?[βbeta]\b|TGF-?B\b'),
-    ("TGF-α", r'\bTGF-?[αalpha]\b|transforming growth factor-?[αalpha]\b|TGF-?A\b'),
-    
-    # Hepatocyte Growth Factor
-    ("HGF", r'\bHGF\b|hepatocyte growth factor\b'),
-    
-    # Brain-Derived Neurotrophic Factor
-    ("BDNF", r'\bBDNF\b|brain-?derived neurotrophic factor\b'),
-    
-    # Granulocyte Colony-Stimulating Factor
-    ("G-CSF", r'\bG-?CSF\b|granulocyte colony-?stimulating factor\b'),
-    
-    # Granulocyte-Macrophage Colony-Stimulating Factor
-    ("GM-CSF", r'\bGM-?CSF\b|granulocyte-?macrophage colony-?stimulating factor\b'),
-    
-    # Erythropoietin
-    ("EPO", r'\bEPO\b|erythropoietin\b'),
-    
-    # Growth Hormone
-    ("GH", r'\bGH\b|growth hormone\b|somatotropin\b'),
-    
-    # Interleukins (common growth-promoting ones)
-    ("IL-2", r'\bIL-?2\b|interleukin-?2\b'),
-    ("IL-3", r'\bIL-?3\b|interleukin-?3\b'),
-    ("IL-6", r'\bIL-?6\b|interleukin-?6\b'),
-    ("IL-7", r'\bIL-?7\b|interleukin-?7\b'),
-    
-    # Tumor Necrosis Factor
-    ("TNF-α", r'\bTNF-?[αalpha]\b|tumor necrosis factor-?[αalpha]\b|TNF-?A\b'),
-    
-    # Connective Tissue Growth Factor
-    ("CTGF", r'\bCTGF\b|connective tissue growth factor\b'),
-    
-    # Insulin-like Growth Factor Binding Proteins
-    ("IGFBP", r'\bIGFBP-?\d+\b|insulin-?like growth factor binding protein-?\d*\b'),
+    # Bone Morphogenetic Protein 2
+    # ("Bone Morphogenetic Protein 2 (BMP-2)", r'(?:[Bb]one[\s-]*[Mm]orphogenetic[\s-]*[Pp]rotein[\s-]*2|BMP[\s-]?2|hBMP[\s-]?2|rhBMP[\s-]?2|ErhBMP[\s-]?2|E\.BMP[\s-]?2)'),
+
+    # Insulin-like Growth Factor 1
+    ("Insulin-like Growth Factor 1 (IGF-1)", r'(?:[Ii]nsulin[\s-]*like[\s-]*[Gg]rowth[\s-]*[Ff]actor[\s-]*1|IGF[\s-]?1|IGF1|rhIGF[\s-]?1|hIGF[\s-]?1)'),
+
 ]
 
 

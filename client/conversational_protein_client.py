@@ -12,9 +12,12 @@ import hashlib
 import json
 import os
 import re
+import subprocess
+import sys
 import time
 from collections import Counter
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple, Set, Annotated
 from typing_extensions import TypedDict
 from langgraph.graph import StateGraph, START, END
@@ -22,6 +25,14 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph.message import add_messages
 from langgraph.types import interrupt, Command
 import pandas as pd
+
+# Memory debugging
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+except ImportError:
+    PSUTIL_AVAILABLE = False
+    print("[WARNING] psutil not available - memory debugging will be limited")
 from protein_search_client import ProteinSearchClient
 from search_agent import SearchAgent
 from external_apis import fetch_metadata
@@ -29,6 +40,7 @@ from scripts.filter1 import filter_growth_factors
 from scripts.extract_parameters import extract_parameters_from_dataframe
 from scripts.filter_human_ecoli import filter_human_ecoli_gf
 from dotenv import load_dotenv
+from database import get_db_connection, insert_metadata_bulk, update_pdf_found_from_verified_csv, update_methods_validation_from_csv
 
 try:
     from langsmith import Client as LangSmithClient
@@ -46,19 +58,62 @@ except ImportError:  # pragma: no cover - optional dependency
 load_dotenv()
 
 # ============================================================================
-# METADATA CACHE (for large datasets)
+# MEMORY DEBUGGING UTILITIES
 # ============================================================================
 
-# In-memory cache for metadata that's too large for state
+def get_memory_usage() -> Dict[str, Any]:
+    """Get current memory usage statistics"""
+    if not PSUTIL_AVAILABLE:
+        return {"error": "psutil not available"}
+    try:
+        process = psutil.Process(os.getpid())
+        mem_info = process.memory_info()
+        return {
+            "rss_mb": mem_info.rss / 1024 / 1024,  # Resident Set Size in MB
+            "vms_mb": mem_info.vms / 1024 / 1024,  # Virtual Memory Size in MB
+            "percent": process.memory_percent(),
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+def log_memory_usage(context: str, cache_size: int = None):
+    """Log memory usage with context"""
+    mem = get_memory_usage()
+    cache_info = f", Cache entries: {cache_size}" if cache_size is not None else f", Cache entries: {len(_metadata_cache)}"
+    if "error" not in mem:
+        print(f"[MEMORY DEBUG] {context}: RSS={mem.get('rss_mb', 0):.2f}MB, "
+              f"VMS={mem.get('vms_mb', 0):.2f}MB, "
+              f"Percent={mem.get('percent', 0):.2f}%{cache_info}")
+    else:
+        print(f"[MEMORY DEBUG] {context}: {mem.get('error', 'Unknown error')}{cache_info}")
+
+def estimate_dataframe_size_mb(df: pd.DataFrame) -> float:
+    """Estimate DataFrame memory usage in MB"""
+    try:
+        return df.memory_usage(deep=True).sum() / 1024 / 1024
+    except:
+        return 0.0
+
+def estimate_cache_size_mb() -> float:
+    """Estimate total cache size in MB"""
+    total_size = 0
+    for cache_id, metadata in _metadata_cache.items():
+        records = metadata.get("records", [])
+        # Rough estimate: each record ~1KB, plus overhead
+        total_size += len(records) * 1024
+    return total_size / 1024 / 1024
+
+# ============================================================================
+# METADATA CACHE
+# ============================================================================
+
+# In-memory cache for metadata (all datasets stored in cache)
 # Key: cache_id (e.g., "metadata_thread123_1234567890")
 # Value: Full metadata payload with records
 _metadata_cache: Dict[str, Dict[str, Any]] = {}
 
 # Mapping of thread_id to cache_ids for cleanup
 _thread_cache_mapping: Dict[str, List[str]] = {}
-
-# Threshold for using external cache (number of articles)
-METADATA_CACHE_THRESHOLD = 100
 
 
 def get_metadata_from_cache(cache_id: str) -> Optional[Dict[str, Any]]:
@@ -68,6 +123,8 @@ def get_metadata_from_cache(cache_id: str) -> Optional[Dict[str, Any]]:
 
 def cleanup_metadata_cache(thread_id: str):
     """Remove all cache entries for a given thread_id"""
+    log_memory_usage(f"[CACHE CLEANUP START] Thread: {thread_id}", len(_metadata_cache))
+    
     if thread_id in _thread_cache_mapping:
         cache_ids = _thread_cache_mapping[thread_id]
         for cache_id in cache_ids:
@@ -75,6 +132,7 @@ def cleanup_metadata_cache(thread_id: str):
                 del _metadata_cache[cache_id]
         del _thread_cache_mapping[thread_id]
         if cache_ids:
+            log_memory_usage(f"[CACHE CLEANUP END] Thread: {thread_id}", len(_metadata_cache))
             print(f"[CACHE] Cleaned up {len(cache_ids)} cache entries for thread: {thread_id}")
     else:
         # Fallback: cleanup by pattern matching (for cache_ids created before mapping)
@@ -88,6 +146,7 @@ def cleanup_metadata_cache(thread_id: str):
             for key in keys_to_remove:
                 del _metadata_cache[key]
             if keys_to_remove:
+                log_memory_usage(f"[CACHE CLEANUP END] Pattern-based", len(_metadata_cache))
                 print(f"[CACHE] Cleaned up {len(keys_to_remove)} cache entries (pattern-based cleanup)")
 
 
@@ -480,6 +539,18 @@ class WorkflowState(TypedDict):
     
     # Metadata payload from external API (serialized for checkpointer)
     protein_metadata: Optional[Dict[str, Any]]
+    
+    # Path to final filtered CSV file for PDF downloader
+    final_filtered_csv_path: Optional[str]
+    
+    # Path to verified PDFs folder from PDF downloader API
+    pdf_verified_folder_path: Optional[str]
+    
+    # PDF processing results from GROBID extraction
+    pdf_processing_results: Optional[Dict[str, Any]]
+    
+    # Methods validation results from classification
+    methods_validation_results: Optional[Dict[str, Any]]
 
 def _state_context_snapshot(state: WorkflowState) -> Dict[str, Any]:
     """Return a trimmed snapshot of the current state for logging/evaluation."""
@@ -735,6 +806,8 @@ def build_workflow(llm_client: 'LLMClient', mcp: 'ProteinSearchClient'):
         
         if json_str:
             try:
+                # Fix Python None -> JSON null before parsing
+                json_str = re.sub(r'\bNone\b', 'null', json_str)
                 extracted = json.loads(json_str)
                 
                 # Extract core entities
@@ -1249,6 +1322,9 @@ def build_workflow(llm_client: 'LLMClient', mcp: 'ProteinSearchClient'):
             print("[metadata_fetcher_node] No selected protein, skipping metadata fetch")
             return {}
 
+        # Extract accession from selected protein
+        accession = getattr(selected, "accession", None) if selected else None
+
         protein_name = getattr(selected, "name", None) or state.get("protein_name", "")
         if not protein_name:
             print("[metadata_fetcher_node] No protein name available, skipping metadata fetch")
@@ -1257,8 +1333,8 @@ def build_workflow(llm_client: 'LLMClient', mcp: 'ProteinSearchClient'):
         print(f"[metadata_fetcher_node] Fetching metadata for: {protein_name}")
 
         metadata_sources = ["pubmed", "semantic_scholar"]
-        metadata_start = "2020-01"
-        metadata_end = "2021-01"
+        metadata_start = "2000-01"
+        metadata_end = "2024-12"
         metadata_df = await fetch_metadata(
             queries=[protein_name],
             sources=metadata_sources,
@@ -1271,7 +1347,19 @@ def build_workflow(llm_client: 'LLMClient', mcp: 'ProteinSearchClient'):
             print("[metadata_fetcher_node] Metadata fetch failed or returned None")
             return {"protein_metadata": None}
 
-        metadata_payload: Dict[str, Any]
+        # Initialize metadata_payload to avoid UnboundLocalError
+        metadata_payload: Dict[str, Any] = {
+            "records": [],
+            "columns": [],
+            "shape": [0, 0],
+            "dtypes": {},
+            "source_counts": {},
+            "query": protein_name,
+            "sources": metadata_sources,
+            "start_date": metadata_start,
+            "end_date": metadata_end,
+            "generated_at": datetime.utcnow().isoformat(),
+        }
         total_results = 0
         source_counts: Dict[str, int] = {}
 
@@ -1280,65 +1368,122 @@ def build_workflow(llm_client: 'LLMClient', mcp: 'ProteinSearchClient'):
             if 'source' in metadata_df.columns:
                 source_counts = metadata_df['source'].value_counts().to_dict()
             
-            # Determine if data is large enough for external cache
-            use_cache = total_results > METADATA_CACHE_THRESHOLD
+            # Drop unnecessary columns to reduce memory usage before caching
+            columns_to_drop = [
+                'title_clean', 'authors_clean', 'abstract_clean', 'doi_clean', 'pmid_clean',
+                'is_merged', 'merged_count', 'merge_type', 'original_indices', 'merge_timestamp',
+                'match_type', 'match_value', 'enriched_fields', 'original_sources',
+                'all_dois', 'all_pmids', 'deduplicated_at'
+            ]
+            # Only drop columns that actually exist in the DataFrame
+            existing_columns_to_drop = [col for col in columns_to_drop if col in metadata_df.columns]
+            if existing_columns_to_drop:
+                metadata_df = metadata_df.drop(columns=existing_columns_to_drop)
+                print(f"[metadata_fetcher_node] Dropped {len(existing_columns_to_drop)} unnecessary columns: {existing_columns_to_drop}")
             
-            if use_cache:
-                # Large dataset - store in external cache
-                # Generate unique cache_id using protein_name hash + timestamp
-                protein_hash = hashlib.md5(protein_name.encode()).hexdigest()[:8]
-                timestamp = int(time.time())
-                cache_id = f"metadata_{protein_hash}_{timestamp}"
-                
-                # Store full data in cache
-                full_metadata = {
-                    "records": metadata_df.to_dict(orient="records"),
-                    "columns": list(metadata_df.columns),
-                    "shape": list(metadata_df.shape),
-                    "dtypes": {col: str(dtype) for col, dtype in metadata_df.dtypes.items()},
-                    "source_counts": source_counts,
-                    "query": protein_name,
-                    "sources": metadata_sources,
-                    "start_date": metadata_start,
-                    "end_date": metadata_end,
-                    "generated_at": datetime.utcnow().isoformat(),
-                }
-                _metadata_cache[cache_id] = full_metadata
-                
-                # Track cache_id for cleanup (we'll need to get thread_id from config later)
-                # For now, we'll use a pattern-based cleanup approach
-                
-                # Store only reference + summary in state
-                metadata_payload = {
-                    "cache_id": cache_id,  # Reference to cache
-                    "summary": {
-                        "total_count": total_results,
-                        "columns": list(metadata_df.columns),
-                        "shape": list(metadata_df.shape),
-                        "sources": source_counts,
-                    },
-                    "query": protein_name,
-                    "sources": metadata_sources,
-                    "start_date": metadata_start,
-                    "end_date": metadata_end,
-                    "generated_at": datetime.utcnow().isoformat(),
-                }
-                print(f"[metadata_fetcher_node] Metadata fetched successfully: {total_results} articles (stored in cache: {cache_id})")
+            # Always store in external cache regardless of size
+            # Generate unique cache_id using protein_name hash + timestamp
+            protein_hash = hashlib.md5(protein_name.encode()).hexdigest()[:8]
+            timestamp = int(time.time())
+            cache_id = f"metadata_{protein_hash}_{timestamp}"
+            
+            # Add accession column to DataFrame before caching
+            if accession:
+                metadata_df["accession"] = accession
             else:
-                # Small dataset - store directly in state
-                metadata_payload = {
-                    "records": metadata_df.to_dict(orient="records"),
+                metadata_df["accession"] = None
+            
+            # Store full data in cache (always executed, regardless of accession)
+            full_metadata = {
+                "records": metadata_df.to_dict(orient="records"),
+                "columns": list(metadata_df.columns),
+                "shape": list(metadata_df.shape),
+                "dtypes": {col: str(dtype) for col, dtype in metadata_df.dtypes.items()},
+                "source_counts": source_counts,
+                "query": protein_name,
+                "sources": metadata_sources,
+                "start_date": metadata_start,
+                "end_date": metadata_end,
+                "generated_at": datetime.utcnow().isoformat(),
+            }
+            _metadata_cache[cache_id] = full_metadata
+            
+            # DEBUG: Log memory usage after caching
+            df_size_mb = estimate_dataframe_size_mb(metadata_df)
+            cache_size_mb = estimate_cache_size_mb()
+            log_memory_usage(
+                f"[metadata_fetcher_node] After caching (cache_id: {cache_id})",
+                len(_metadata_cache)
+            )
+            print(f"[MEMORY DEBUG] DataFrame size: {df_size_mb:.2f}MB, "
+                  f"Total cache size: {cache_size_mb:.2f}MB, "
+                  f"Records cached: {len(full_metadata.get('records', []))}")
+            
+            # Cleanup: DataFrame is now in cache, can be deleted after CSV/DB operations
+            
+            # Store only reference + summary in state (always set, regardless of cache size)
+            metadata_payload = {
+                "cache_id": cache_id,  # Reference to cache
+                "summary": {
+                    "total_count": total_results,
                     "columns": list(metadata_df.columns),
                     "shape": list(metadata_df.shape),
-                    "dtypes": {col: str(dtype) for col, dtype in metadata_df.dtypes.items()},
-                    "source_counts": source_counts,
-                    "query": protein_name,
-                    "sources": metadata_sources,
-                    "start_date": metadata_start,
-                    "end_date": metadata_end,
-                    "generated_at": datetime.utcnow().isoformat(),
-                }
-                print(f"[metadata_fetcher_node] Metadata fetched successfully: {total_results} articles (stored in state)")
+                    "sources": source_counts,
+                },
+                "query": protein_name,
+                "sources": metadata_sources,
+                "start_date": metadata_start,
+                "end_date": metadata_end,
+                "generated_at": datetime.utcnow().isoformat(),
+            }
+            print(f"[metadata_fetcher_node] Metadata fetched successfully: {total_results} articles (stored in cache: {cache_id})")
+            
+            # Auto-cleanup if cache is getting large
+            if len(_metadata_cache) > 10:
+                print(f"[MEMORY DEBUG] Cache size ({len(_metadata_cache)}) exceeds threshold, running cleanup...")
+                cleanup_stale_cache(max_age_seconds=1800)
+                log_memory_usage("[metadata_fetcher_node] After auto-cleanup", len(_metadata_cache))
+            
+            # Save initial fetched metadata to CSV
+            try:
+                csv_dir = Path("metadata_exports")
+                
+                # Ensure directory exists with proper permissions
+                if not csv_dir.exists():
+                    csv_dir.mkdir(parents=True, mode=0o777)
+                else:
+                    # Try to fix permissions on existing directory
+                    try:
+                        os.chmod(csv_dir, 0o777)
+                    except Exception as perm_error:
+                        print(f"[metadata_fetcher_node] Warning: Could not change directory permissions: {perm_error}")
+                
+                safe_protein_name = re.sub(r'[^\w\s-]', '', protein_name).strip().replace(' ', '_')[:50]
+                csv_filename = csv_dir / f"{safe_protein_name}_{timestamp}_01_fetched.csv"
+                metadata_df.to_csv(csv_filename, index=False)
+                
+                # Try to set file permissions after creation
+                try:
+                    os.chmod(csv_filename, 0o666)
+                except Exception as perm_error:
+                    print(f"[metadata_fetcher_node] Warning: Could not set file permissions: {perm_error}")
+                
+                print(f"[metadata_fetcher_node] Saved {total_results} articles to CSV: {csv_filename}")
+            except Exception as e:
+                print(f"[metadata_fetcher_node] Error saving CSV: {e}")
+            
+            # Insert to database after CSV save
+            try:
+                conn = get_db_connection()
+                insert_metadata_bulk(metadata_df, "metadata_fetched", conn)
+                print(f"[metadata_fetcher_node] Saved {total_results} articles to database")
+                conn.close()
+            except Exception as e:
+                print(f"[metadata_fetcher_node] Error saving to database: {e}")
+            
+            # Cleanup: Delete DataFrame after caching, CSV save, and DB insert
+            del metadata_df
+            print(f"[MEMORY DEBUG] Deleted DataFrame after caching and saving")
         else:
             metadata_payload = {
                 "records": [],
@@ -1377,7 +1522,7 @@ def build_workflow(llm_client: 'LLMClient', mcp: 'ProteinSearchClient'):
 
     # metadata_processor_node - Read from cache and convert to DataFrame
     async def metadata_processor_node(state: WorkflowState) -> Dict[str, Any]:
-        """Read metadata from cache (if cached) or state, convert to DataFrame, and print it."""
+        """Read metadata from cache, convert to DataFrame, and process it."""
         print("\n[metadata_processor_node] Processing metadata...")
         
         metadata_payload = state.get("protein_metadata")
@@ -1385,38 +1530,38 @@ def build_workflow(llm_client: 'LLMClient', mcp: 'ProteinSearchClient'):
             print("[metadata_processor_node] No metadata payload found in state")
             return {}
         
+        # Track CSV path for PDF downloader node
+        final_csv_path: Optional[str] = None
+        
+        # Metadata is always stored in cache now
+        if "cache_id" not in metadata_payload:
+            print("[metadata_processor_node] Error: cache_id not found in metadata_payload. Metadata should always be cached.")
+            return {}
+        
+        cache_id = metadata_payload.get("cache_id")
+        print(f"[metadata_processor_node] Retrieving metadata from cache: {cache_id}")
+        
         metadata_df: Optional[pd.DataFrame] = None
         
-        # Check if metadata is stored in cache (large dataset)
-        if "cache_id" in metadata_payload:
-            cache_id = metadata_payload.get("cache_id")
-            print(f"[metadata_processor_node] Retrieving metadata from cache: {cache_id}")
-            
-            # Retrieve full data from cache
-            cached_data = get_metadata_from_cache(cache_id)
-            if cached_data and "records" in cached_data:
-                # Convert cached records to DataFrame
-                records = cached_data.get("records", [])
-                columns = cached_data.get("columns", [])
-                
-                if records and columns:
-                    metadata_df = pd.DataFrame(records, columns=columns)
-                    print(f"[metadata_processor_node] Successfully loaded {len(metadata_df)} articles from cache")
-                else:
-                    print("[metadata_processor_node] Cache data missing records or columns")
-            else:
-                print(f"[metadata_processor_node] Cache entry not found or invalid for cache_id: {cache_id}")
-        else:
-            # Small dataset - data is already in state
-            print("[metadata_processor_node] Metadata stored in state (small dataset)")
-            records = metadata_payload.get("records", [])
-            columns = metadata_payload.get("columns", [])
+        # Retrieve full data from cache
+        cached_data = get_metadata_from_cache(cache_id)
+        if cached_data and "records" in cached_data:
+            log_memory_usage(f"[metadata_processor_node] Loading from cache: {cache_id}", len(_metadata_cache))
+            # Convert cached records to DataFrame
+            records = cached_data.get("records", [])
+            columns = cached_data.get("columns", [])
             
             if records and columns:
                 metadata_df = pd.DataFrame(records, columns=columns)
-                print(f"[metadata_processor_node] Successfully loaded {len(metadata_df)} articles from state")
+                log_memory_usage(f"[metadata_processor_node] After DataFrame creation ({len(metadata_df)} rows)", len(_metadata_cache))
+                df_size_mb = estimate_dataframe_size_mb(metadata_df)
+                print(f"[MEMORY DEBUG] Loaded DataFrame size: {df_size_mb:.2f}MB")
+                print(f"[metadata_processor_node] Successfully loaded {len(metadata_df)} articles from cache")
             else:
-                print("[metadata_processor_node] No records found in state metadata")
+                print("[metadata_processor_node] Cache data missing records or columns")
+        else:
+            print(f"[metadata_processor_node] Cache entry not found or invalid for cache_id: {cache_id}")
+            return {}
         
         # Apply filtering if DataFrame is available
         if metadata_df is not None and not metadata_df.empty:
@@ -1429,14 +1574,60 @@ def build_workflow(llm_client: 'LLMClient', mcp: 'ProteinSearchClient'):
             
             print(f"[metadata_processor_node] Filtering complete: {original_count} → {filtered_count} articles")
             
-            # Replace original DataFrame with filtered results
-            metadata_df = filtered_df
+            # Cleanup: Delete original DataFrame after filtering (will be replaced by filtered_df)
+            del metadata_df
             
-            # Update cache/state with filtered DataFrame
-            if "cache_id" in metadata_payload:
-                # Update cache with filtered data
-                cache_id = metadata_payload.get("cache_id")
-                if cache_id and metadata_df is not None and not metadata_df.empty:
+            # Save growth factor filtered results to CSV
+            if filtered_df is not None and not filtered_df.empty:
+                try:
+                    cache_id = metadata_payload.get("cache_id", "unknown")
+                    # Extract timestamp from cache_id (format: metadata_{hash}_{timestamp})
+                    timestamp = cache_id.split("_")[-1] if "_" in cache_id else str(int(time.time()))
+                    protein_name = metadata_payload.get("query", "unknown")
+                    safe_protein_name = re.sub(r'[^\w\s-]', '', protein_name).strip().replace(' ', '_')[:50]
+                    csv_dir = Path("metadata_exports")
+                    
+                    # Ensure directory exists with proper permissions
+                    if not csv_dir.exists():
+                        csv_dir.mkdir(parents=True, mode=0o777)
+                    else:
+                        # Try to fix permissions on existing directory
+                        try:
+                            os.chmod(csv_dir, 0o777)
+                        except Exception as perm_error:
+                            print(f"[metadata_processor_node] Warning: Could not change directory permissions: {perm_error}")
+                    
+                    csv_filename = csv_dir / f"{safe_protein_name}_{timestamp}_02_growth_factor_filtered.csv"
+                    filtered_df.to_csv(csv_filename, index=False)
+                    
+                    # Try to set file permissions after creation
+                    try:
+                        os.chmod(csv_filename, 0o666)
+                    except Exception as perm_error:
+                        print(f"[metadata_processor_node] Warning: Could not set file permissions: {perm_error}")
+                    
+                    print(f"[metadata_processor_node] Saved {filtered_count} articles (after growth factor filter) to CSV: {csv_filename}")
+                    log_memory_usage(f"[metadata_processor_node] After growth factor filter", len(_metadata_cache))
+                except Exception as e:
+                    print(f"[metadata_processor_node] Error saving growth factor filtered CSV: {e}")
+                
+                # Insert to database after CSV save
+                try:
+                    conn = get_db_connection()
+                    insert_metadata_bulk(filtered_df, "metadata_growth_factor_filtered", conn)
+                    print(f"[metadata_processor_node] Saved {filtered_count} articles to database (stage 2)")
+                    conn.close()
+                except Exception as e:
+                    print(f"[metadata_processor_node] Error saving to database (stage 2): {e}")
+            
+            # Replace original DataFrame with filtered results
+            # Note: metadata_df was already deleted above, so this creates a new reference
+            metadata_df = filtered_df
+            # Cleanup: filtered_df is now referenced by metadata_df, safe to delete after cache update
+            
+            # Update cache with filtered DataFrame
+            cache_id = metadata_payload.get("cache_id")
+            if cache_id and metadata_df is not None and not metadata_df.empty:
                     # Recalculate source counts for filtered data
                     filtered_source_counts = {}
                     if 'source' in metadata_df.columns:
@@ -1465,26 +1656,9 @@ def build_workflow(llm_client: 'LLMClient', mcp: 'ProteinSearchClient'):
                         "sources": filtered_source_counts,
                     }
                     print(f"[metadata_processor_node] Updated cache entry: {cache_id}")
-            else:
-                # Update state directly with filtered data
-                if metadata_df is not None and not metadata_df.empty:
-                    filtered_source_counts = {}
-                    if 'source' in metadata_df.columns:
-                        filtered_source_counts = metadata_df['source'].value_counts().to_dict()
-                    
-                    metadata_payload = {
-                        "records": metadata_df.to_dict(orient="records"),
-                        "columns": list(metadata_df.columns),
-                        "shape": list(metadata_df.shape),
-                        "dtypes": {col: str(dtype) for col, dtype in metadata_df.dtypes.items()},
-                        "source_counts": filtered_source_counts,
-                        "query": metadata_payload.get("query", ""),
-                        "sources": metadata_payload.get("sources", []),
-                        "start_date": metadata_payload.get("start_date", ""),
-                        "end_date": metadata_payload.get("end_date", ""),
-                        "generated_at": metadata_payload.get("generated_at", datetime.utcnow().isoformat()),
-                    }
-                    print(f"[metadata_processor_node] Updated state with filtered data")
+                
+                # Cleanup: filtered_df is now in cache and referenced by metadata_df, can delete old reference
+                # (metadata_df will be reused, so we keep it)
             
             # Print filtered DataFrame summary BEFORE parameter extraction
             if metadata_df is not None and not metadata_df.empty:
@@ -1509,8 +1683,8 @@ def build_workflow(llm_client: 'LLMClient', mcp: 'ProteinSearchClient'):
                         print(f"  - {gf}: {count} articles")
                 
                 # Print first few rows
-                print(f"\nFirst 5 rows:")
-                print(metadata_df.head().to_string())
+                # print(f"\nFirst 5 rows:")
+                # print(metadata_df.head().to_string())
                 
                 print(f"{'='*80}\n")
             
@@ -1527,12 +1701,57 @@ def build_workflow(llm_client: 'LLMClient', mcp: 'ProteinSearchClient'):
                     print(f"\n[metadata_processor_node] Starting LLM parameter extraction for {len(metadata_df)} articles...")
                     try:
                         # Extract parameters asynchronously
+                        # Note: This creates a new DataFrame, old one will be garbage collected
+                        old_metadata_df = metadata_df
                         metadata_df = await extract_parameters_from_dataframe(metadata_df, start_idx=0)
+                        # Cleanup: Delete old DataFrame after extraction
+                        del old_metadata_df
                         print(f"[metadata_processor_node] Parameter extraction complete")
                         
-                        # Update cache/state with extracted parameters
-                        if "cache_id" in metadata_payload:
-                            # Update cache with extracted data
+                        # Save parameter extraction results to CSV
+                        if metadata_df is not None and not metadata_df.empty:
+                            try:
+                                cache_id = metadata_payload.get("cache_id", "unknown")
+                                # Extract timestamp from cache_id (format: metadata_{hash}_{timestamp})
+                                timestamp = cache_id.split("_")[-1] if "_" in cache_id else str(int(time.time()))
+                                protein_name = metadata_payload.get("query", "unknown")
+                                safe_protein_name = re.sub(r'[^\w\s-]', '', protein_name).strip().replace(' ', '_')[:50]
+                                csv_dir = Path("metadata_exports")
+                                
+                                # Ensure directory exists with proper permissions
+                                if not csv_dir.exists():
+                                    csv_dir.mkdir(parents=True, mode=0o777)
+                                else:
+                                    # Try to fix permissions on existing directory
+                                    try:
+                                        os.chmod(csv_dir, 0o777)
+                                    except Exception as perm_error:
+                                        print(f"[metadata_processor_node] Warning: Could not change directory permissions: {perm_error}")
+                                
+                                csv_filename = csv_dir / f"{safe_protein_name}_{timestamp}_03_parameters_extracted.csv"
+                                metadata_df.to_csv(csv_filename, index=False)
+                                
+                                # Try to set file permissions after creation
+                                try:
+                                    os.chmod(csv_filename, 0o666)
+                                except Exception as perm_error:
+                                    print(f"[metadata_processor_node] Warning: Could not set file permissions: {perm_error}")
+                                
+                                print(f"[metadata_processor_node] Saved {len(metadata_df)} articles (after parameter extraction) to CSV: {csv_filename}")
+                                log_memory_usage(f"[metadata_processor_node] After parameter extraction", len(_metadata_cache))
+                            except Exception as e:
+                                print(f"[metadata_processor_node] Error saving parameter extraction CSV: {e}")
+                            
+                            # Insert to database after CSV save
+                            try:
+                                conn = get_db_connection()
+                                insert_metadata_bulk(metadata_df, "metadata_parameters_extracted", conn)
+                                print(f"[metadata_processor_node] Saved {len(metadata_df)} articles to database (stage 3)")
+                                conn.close()
+                            except Exception as e:
+                                print(f"[metadata_processor_node] Error saving to database (stage 3): {e}")
+                        
+                        # Update cache with extracted parameters
                             cache_id = metadata_payload.get("cache_id")
                             if cache_id and metadata_df is not None and not metadata_df.empty:
                                 filtered_source_counts = {}
@@ -1562,32 +1781,14 @@ def build_workflow(llm_client: 'LLMClient', mcp: 'ProteinSearchClient'):
                                     "sources": filtered_source_counts,
                                 }
                                 print(f"[metadata_processor_node] Updated cache entry with extracted parameters: {cache_id}")
-                        else:
-                            # Update state directly with extracted data
-                            if metadata_df is not None and not metadata_df.empty:
-                                filtered_source_counts = {}
-                                if 'source' in metadata_df.columns:
-                                    filtered_source_counts = metadata_df['source'].value_counts().to_dict()
-                                
-                                metadata_payload = {
-                                    "records": metadata_df.to_dict(orient="records"),
-                                    "columns": list(metadata_df.columns),
-                                    "shape": list(metadata_df.shape),
-                                    "dtypes": {col: str(dtype) for col, dtype in metadata_df.dtypes.items()},
-                                    "source_counts": filtered_source_counts,
-                                    "query": metadata_payload.get("query", ""),
-                                    "sources": metadata_payload.get("sources", []),
-                                    "start_date": metadata_payload.get("start_date", ""),
-                                    "end_date": metadata_payload.get("end_date", ""),
-                                    "generated_at": metadata_payload.get("generated_at", datetime.utcnow().isoformat()),
-                                }
-                                print(f"[metadata_processor_node] Updated state with extracted parameters")
                     except Exception as e:
                         print(f"[metadata_processor_node] Error during parameter extraction: {e}")
                         import traceback
                         traceback.print_exc()
                 else:
                     print(f"[metadata_processor_node] Parameters already extracted, skipping LLM extraction")
+            
+            # Cleanup: After parameter extraction, old DataFrame references are cleared
             
             # Apply final filtering (Human + E. coli + Growth Factor Pattern Match)
             if metadata_df is not None and not metadata_df.empty:
@@ -1602,13 +1803,66 @@ def build_workflow(llm_client: 'LLMClient', mcp: 'ProteinSearchClient'):
                     
                     try:
                         # Apply final filtering
+                        # Note: This creates a new DataFrame, old one will be garbage collected
+                        old_metadata_df = metadata_df
                         metadata_df = filter_human_ecoli_gf(metadata_df)
+                        # Cleanup: Delete old DataFrame after filtering
+                        del old_metadata_df
                         final_count = len(metadata_df) if metadata_df is not None and not metadata_df.empty else 0
                         print(f"[metadata_processor_node] Final filtering complete: {pre_final_count} → {final_count} articles")
                         
-                        # Update cache/state with final filtered DataFrame
-                        if "cache_id" in metadata_payload:
-                            # Update cache with final filtered data
+                        # Save final filtered results to CSV
+                        final_csv_path = None  # Initialize to None (will be set in outer scope)
+                        if metadata_df is not None and not metadata_df.empty:
+                            try:
+                                cache_id = metadata_payload.get("cache_id", "unknown")
+                                # Extract timestamp from cache_id (format: metadata_{hash}_{timestamp})
+                                timestamp = cache_id.split("_")[-1] if "_" in cache_id else str(int(time.time()))
+                                protein_name = metadata_payload.get("query", "unknown")
+                                safe_protein_name = re.sub(r'[^\w\s-]', '', protein_name).strip().replace(' ', '_')[:50]
+                                csv_dir = Path("metadata_exports")
+                                
+                                # Ensure directory exists with proper permissions
+                                if not csv_dir.exists():
+                                    csv_dir.mkdir(parents=True, mode=0o777)
+                                else:
+                                    # Try to fix permissions on existing directory
+                                    try:
+                                        os.chmod(csv_dir, 0o777)
+                                    except Exception as perm_error:
+                                        print(f"[metadata_processor_node] Warning: Could not change directory permissions: {perm_error}")
+                                
+                                # Add "pdf found" column set to False for all rows
+                                if "pdf found" not in metadata_df.columns:
+                                    metadata_df["pdf found"] = False
+                                
+                                csv_filename = csv_dir / f"{safe_protein_name}_{timestamp}_04_final_filtered.csv"
+                                metadata_df.to_csv(csv_filename, index=False)
+                                
+                                # Try to set file permissions after creation
+                                try:
+                                    os.chmod(csv_filename, 0o666)
+                                except Exception as perm_error:
+                                    print(f"[metadata_processor_node] Warning: Could not set file permissions: {perm_error}")
+                                
+                                final_csv_path = str(csv_filename)
+                                print(f"[metadata_processor_node] Saved {final_count} articles (after final filter) to CSV: {csv_filename}")
+                                log_memory_usage(f"[metadata_processor_node] After final filter", len(_metadata_cache))
+                            except Exception as e:
+                                print(f"[metadata_processor_node] Error saving final filtered CSV: {e}")
+                                # Don't set final_csv_path if CSV save fails - let pdf_downloader_node handle the error
+                                final_csv_path = None
+                            
+                            # Insert to database after CSV save
+                            try:
+                                conn = get_db_connection()
+                                insert_metadata_bulk(metadata_df, "metadata_final_filtered", conn)
+                                print(f"[metadata_processor_node] Saved {final_count} articles to database (stage 4)")
+                                conn.close()
+                            except Exception as e:
+                                print(f"[metadata_processor_node] Error saving to database (stage 4): {e}")
+                        
+                        # Update cache with final filtered DataFrame
                             cache_id = metadata_payload.get("cache_id")
                             if cache_id and metadata_df is not None and not metadata_df.empty:
                                 final_source_counts = {}
@@ -1638,26 +1892,6 @@ def build_workflow(llm_client: 'LLMClient', mcp: 'ProteinSearchClient'):
                                     "sources": final_source_counts,
                                 }
                                 print(f"[metadata_processor_node] Updated cache entry with final filtered data: {cache_id}")
-                        else:
-                            # Update state directly with final filtered data
-                            if metadata_df is not None and not metadata_df.empty:
-                                final_source_counts = {}
-                                if 'source' in metadata_df.columns:
-                                    final_source_counts = metadata_df['source'].value_counts().to_dict()
-                                
-                                metadata_payload = {
-                                    "records": metadata_df.to_dict(orient="records"),
-                                    "columns": list(metadata_df.columns),
-                                    "shape": list(metadata_df.shape),
-                                    "dtypes": {col: str(dtype) for col, dtype in metadata_df.dtypes.items()},
-                                    "source_counts": final_source_counts,
-                                    "query": metadata_payload.get("query", ""),
-                                    "sources": metadata_payload.get("sources", []),
-                                    "start_date": metadata_payload.get("start_date", ""),
-                                    "end_date": metadata_payload.get("end_date", ""),
-                                    "generated_at": metadata_payload.get("generated_at", datetime.utcnow().isoformat()),
-                                }
-                                print(f"[metadata_processor_node] Updated state with final filtered data")
                     except Exception as e:
                         print(f"[metadata_processor_node] Error during final filtering: {e}")
                         import traceback
@@ -1719,18 +1953,567 @@ def build_workflow(llm_client: 'LLMClient', mcp: 'ProteinSearchClient'):
                 print(metadata_df.dtypes.to_string())
                 
                 # Print sample of key columns if they exist (including extracted parameters)
-                key_columns = ['title', 'abstract', 'authors', 'journal', 'doi', 'publication_year', 'Growth_Factor_Name', 'Q1_Protein_Production', 'Q3_Recombinant_Proteins', 'Q4_Species', 'Q5_Host_Organism']
+                key_columns = ['title', 'abstract', 'authors', 'journal', 'doi', 'publication year', 'Growth_Factor_Name', 'Q1_Protein_Production', 'Q3_Recombinant_Proteins', 'Q4_Species', 'Q5_Host_Organism']
                 available_key_columns = [col for col in key_columns if col in metadata_df.columns]
-                if available_key_columns:
-                    print(f"\nSample data from key columns (including extracted parameters):")
-                    print(metadata_df[available_key_columns].head(3).to_string())
+                # if available_key_columns:
+                    # print(f"\nSample data from key columns (including extracted parameters):")
+                    # print(metadata_df[available_key_columns].head(3).to_string())
                 
                 print(f"{'='*80}\n")
         else:
             print("[metadata_processor_node] DataFrame is empty or None after filtering")
         
-        # Return updated metadata payload to update state
-        return {"protein_metadata": metadata_payload}
+        # Return updated metadata payload and CSV path to update state
+        result = {"protein_metadata": metadata_payload}
+        if final_csv_path:
+            result["final_filtered_csv_path"] = final_csv_path
+        
+        # Final cleanup: Delete DataFrame at end of node (data is in cache and CSV/DB)
+        # Note: metadata_df may have been deleted earlier in the processing pipeline
+        try:
+            if metadata_df is not None:
+                del metadata_df
+                print(f"[MEMORY DEBUG] Deleted DataFrame at end of metadata_processor_node")
+        except (NameError, UnboundLocalError):
+            # DataFrame already deleted or never created - this is fine
+            pass
+        
+        return result
+
+    # pdf_downloader_node - Upload final filtered CSV to PDF downloader API
+    async def pdf_downloader_node(state: WorkflowState) -> Dict[str, Any]:
+        """Upload the final filtered CSV file to the PDF downloader API."""
+        print("\n[pdf_downloader_node] Uploading CSV to PDF downloader API...")
+        
+        csv_path = state.get("final_filtered_csv_path")
+        if not csv_path:
+            error_msg = "[pdf_downloader_node] Error: No CSV path found in state. Cannot upload to PDF downloader API."
+            print(error_msg)
+            raise ValueError(error_msg)
+        
+        # Check if file exists
+        csv_file = Path(csv_path)
+        if not csv_file.exists():
+            error_msg = f"[pdf_downloader_node] Error: CSV file not found at path: {csv_path}"
+            print(error_msg)
+            raise FileNotFoundError(error_msg)
+        
+        # Get API URL from environment variable
+        api_url = os.getenv("PDF_DOWNLOADER_API_URL", "http://host.docker.internal:8003/upload-csv")
+        print(f"[pdf_downloader_node] API URL: {api_url}")
+        print(f"[pdf_downloader_node] Uploading CSV file: {csv_path}")
+        
+        # Track verified folder path and verified CSV path from API response
+        verified_folder_path: Optional[str] = None
+        verified_csv_path: Optional[str] = None
+        
+        try:
+            # Import requests (already available via LLMClient, but import directly for clarity)
+            import requests
+            
+            # First, check if API is reachable via health endpoint
+            health_url = api_url.replace("/upload-csv", "/health")
+            try:
+                health_response = requests.get(health_url, timeout=5)
+                print(f"[pdf_downloader_node] Health check: {health_response.status_code} - {health_response.text[:100]}")
+            except Exception as health_e:
+                print(f"[pdf_downloader_node] Warning: Health check failed: {health_e}")
+                print(f"[pdf_downloader_node] Proceeding with upload anyway...")
+            
+            # Get file size for logging
+            file_size_mb = csv_file.stat().st_size / (1024 * 1024)
+            print(f"[pdf_downloader_node] CSV file size: {file_size_mb:.2f} MB")
+            
+            # Upload CSV file
+            # Use longer timeout since PDF downloader may take time to process and download PDFs
+            print(f"[pdf_downloader_node] Starting upload (timeout: 600s)...")
+            with open(csv_file, 'rb') as f:
+                files = {'file': (csv_file.name, f, 'text/csv')}
+                response = requests.post(api_url, files=files, timeout=600)  # 10 minutes timeout
+            print(f"[pdf_downloader_node] Upload completed, response status: {response.status_code}")
+            
+            # Check response status
+            response.raise_for_status()
+            
+            # Parse and log JSON response
+            try:
+                response_data = response.json()
+                print(f"\n[pdf_downloader_node] API Response:")
+                print(f"  Message: {response_data.get('message', 'N/A')}")
+                print(f"  Total rows: {response_data.get('total_rows', 'N/A')}")
+                print(f"  PDFs found: {response_data.get('pdfs_found', 'N/A')}")
+                print(f"  Session ID: {response_data.get('session_id', 'N/A')}")
+                
+                output_files = response_data.get('output_files', {})
+                if output_files:
+                    print(f"  Output files:")
+                    verified_csv_rel = output_files.get('verified_csv', '')
+                    print(f"    Verified CSV: {verified_csv_rel}")
+                    verified_folder = output_files.get('verified_folder', '')
+                    print(f"    Verified folder: {verified_folder}")
+                    
+                    # Construct full paths
+                    base_path = os.getenv("PDF_DOWNLOADER_BASE_PATH", "/app/pdfdownloader")
+                    
+                    if verified_csv_rel:
+                        verified_csv_path = str(Path(base_path) / verified_csv_rel)
+                        print(f"[pdf_downloader_node] Verified CSV path: {verified_csv_path}")
+                    
+                    if verified_folder:
+                        verified_folder_path = str(Path(base_path) / verified_folder)
+                        print(f"[pdf_downloader_node] Verified folder path: {verified_folder_path}")
+                
+                print(f"[pdf_downloader_node] CSV uploaded successfully to PDF downloader API")
+            except (ValueError, KeyError) as e:
+                print(f"[pdf_downloader_node] Warning: Could not parse JSON response: {e}")
+                print(f"[pdf_downloader_node] Raw response: {response.text[:500]}")
+            
+        except requests.exceptions.ConnectionError as e:
+            error_msg = f"[pdf_downloader_node] Connection error: API may not be running or unreachable: {e}"
+            print(error_msg)
+            print(f"[pdf_downloader_node] Check if PDF downloader API is running on {api_url}")
+            raise RuntimeError(error_msg) from e
+        except requests.exceptions.Timeout as e:
+            error_msg = f"[pdf_downloader_node] Request timeout: API took longer than 600s to respond: {e}"
+            print(error_msg)
+            print(f"[pdf_downloader_node] The API may still be processing. Check API logs for status.")
+            raise RuntimeError(error_msg) from e
+        except requests.exceptions.RequestException as e:
+            error_msg = f"[pdf_downloader_node] Error uploading CSV to API: {type(e).__name__}: {e}"
+            print(error_msg)
+            if hasattr(e, 'response') and e.response is not None:
+                print(f"[pdf_downloader_node] Response status: {e.response.status_code}")
+                print(f"[pdf_downloader_node] Response body: {e.response.text[:500]}")
+            else:
+                print(f"[pdf_downloader_node] No response received (connection may have been closed)")
+            raise RuntimeError(error_msg) from e
+        except Exception as e:
+            error_msg = f"[pdf_downloader_node] Unexpected error during CSV upload: {e}"
+            print(error_msg)
+            raise RuntimeError(error_msg) from e
+        
+        # Update pdf_found column in database using verified CSV
+        if verified_csv_path and os.path.exists(verified_csv_path):
+            try:
+                conn = get_db_connection()
+                updated_count = update_pdf_found_from_verified_csv(verified_csv_path, conn)
+                print(f"[pdf_downloader_node] Updated {updated_count} rows in metadata_final_filtered with pdf_found status")
+                conn.close()
+            except Exception as e:
+                print(f"[pdf_downloader_node] Error updating database: {e}")
+                # Don't fail the node if database update fails
+        else:
+            if verified_csv_path:
+                print(f"[pdf_downloader_node] Warning: Verified CSV not found at {verified_csv_path}, skipping database update")
+            else:
+                print(f"[pdf_downloader_node] Warning: No verified CSV path in API response, skipping database update")
+        
+        # Return verified folder path for next node
+        result = {}
+        if verified_folder_path:
+            result["pdf_verified_folder_path"] = verified_folder_path
+        return result
+
+    # pdf_processor_node - Process PDFs through GROBID extraction API
+    async def pdf_processor_node(state: WorkflowState) -> Dict[str, Any]:
+        """Execute process_folder.sh script to batch process PDFs through GROBID extraction API."""
+        print("\n[pdf_processor_node] Starting PDF processing through GROBID extraction...")
+        
+        folder_path = state.get("pdf_verified_folder_path")
+        if not folder_path:
+            error_msg = "[pdf_processor_node] Error: No verified folder path found in state. Cannot process PDFs."
+            print(error_msg)
+            raise ValueError(error_msg)
+        
+        # Validate folder exists
+        # Note: If the PDF downloader API container doesn't have the volume mount,
+        # the folder won't be accessible. The API container needs to be restarted with:
+        # docker run -d --name predictabio-api-test -p 8003:8000 \
+        #   -v /Users/eesitasen/Desktop/predictabio/pdfdownloader:/app/pdfdownloader \
+        #   -e PDF_DOWNLOADER_BASE_PATH=/app/pdfdownloader predictabio-api
+        folder = Path(folder_path)
+        if not folder.exists():
+            # Check if it's a volume mount issue - list what's actually in the base directory
+            base_path = Path(folder_path).parent.parent  # Go up to /app/pdfdownloader
+            if base_path.exists():
+                print(f"[pdf_processor_node] Base path exists: {base_path}")
+                try:
+                    contents = list(base_path.iterdir())[:10]
+                    print(f"[pdf_processor_node] Contents of base path: {[str(p.name) for p in contents]}")
+                    # Check if temp_* folders exist but in wrong location
+                    temp_folders = [p for p in contents if p.name.startswith('temp_')]
+                    if temp_folders:
+                        print(f"[pdf_processor_node] Found temp folders in base path: {[str(p.name) for p in temp_folders]}")
+                        print(f"[pdf_processor_node] Note: PDF downloader API may need to be restarted with volume mount")
+                except Exception as e:
+                    print(f"[pdf_processor_node] Error listing base path contents: {e}")
+            else:
+                print(f"[pdf_processor_node] Base path does not exist: {base_path}")
+            error_msg = f"[pdf_processor_node] Error: Folder not found: {folder_path}"
+            print(error_msg)
+            print(f"[pdf_processor_node] This usually means the PDF downloader API container needs to be restarted with a volume mount.")
+            print(f"[pdf_processor_node] Run: /Users/eesitasen/Desktop/predictabio/pdfdownloader/restart_api_container.sh")
+            raise FileNotFoundError(error_msg)
+        
+        if not folder.is_dir():
+            error_msg = f"[pdf_processor_node] Error: Path exists but is not a directory: {folder_path}"
+            print(error_msg)
+            raise FileNotFoundError(error_msg)
+        
+        print(f"[pdf_processor_node] Folder verified: {folder_path}")
+        
+        # Get script path from environment variable or use default
+        script_path = os.getenv(
+            "GROBID_PROCESSOR_SCRIPT_PATH",
+            "/app/grobid_extractor/process_folder.sh"
+        )
+        
+        # Validate script exists
+        script_file = Path(script_path)
+        if not script_file.exists():
+            error_msg = f"[pdf_processor_node] Error: Script not found at: {script_path}"
+            print(error_msg)
+            raise FileNotFoundError(error_msg)
+        
+        # Make script executable if needed
+        if not os.access(script_path, os.X_OK):
+            os.chmod(script_path, 0o755)
+        
+        print(f"[pdf_processor_node] Script path: {script_path}")
+        print(f"[pdf_processor_node] Processing folder: {folder_path}")
+        
+        try:
+            # Execute the script with environment variables for GROBID API
+            print(f"[pdf_processor_node] Executing script...")
+            env = os.environ.copy()
+            # Set GROBID API configuration if not already set
+            if "GROBID_API_HOST" not in env:
+                env["GROBID_API_HOST"] = os.getenv("GROBID_API_HOST", "host.docker.internal")
+            if "GROBID_API_PORT" not in env:
+                env["GROBID_API_PORT"] = os.getenv("GROBID_API_PORT", "9000")
+            
+            result = subprocess.run(
+                [script_path, folder_path],
+                capture_output=True,
+                text=True,
+                timeout=3600,  # 1 hour max timeout
+                check=False,  # We'll check the exit code manually
+                env=env  # Pass environment variables to the script
+            )
+            
+            # Log script output
+            if result.stdout:
+                print(f"[pdf_processor_node] Script stdout:")
+                print(result.stdout)
+            if result.stderr:
+                print(f"[pdf_processor_node] Script stderr:")
+                print(result.stderr)
+            
+            # Check exit code
+            if result.returncode != 0:
+                error_msg = f"[pdf_processor_node] Script failed with exit code {result.returncode}"
+                print(error_msg)
+                if result.stderr:
+                    print(f"[pdf_processor_node] Error output: {result.stderr[:500]}")
+                raise RuntimeError(error_msg)
+            
+            # Parse script output to extract statistics
+            output_text = result.stdout
+            processing_results: Dict[str, Any] = {
+                "success_count": 0,
+                "failed_count": 0,
+                "total_count": 0,
+                "failed_files": [],
+                "output_path": ""
+            }
+            
+            # Extract success count: "✅ Successful: X/Y"
+            success_match = re.search(r'✅\s*Successful:\s*(\d+)/(\d+)', output_text)
+            if success_match:
+                processing_results["success_count"] = int(success_match.group(1))
+                processing_results["total_count"] = int(success_match.group(2))
+            
+            # Extract failed count: "❌ Failed: X/Y"
+            failed_match = re.search(r'❌\s*Failed:\s*(\d+)/(\d+)', output_text)
+            if failed_match:
+                processing_results["failed_count"] = int(failed_match.group(1))
+                if processing_results["total_count"] == 0:
+                    processing_results["total_count"] = int(failed_match.group(2))
+            
+            # Extract output path: "💾 All outputs saved to: ..."
+            output_match = re.search(r'💾\s*All outputs saved to:\s*(.+)', output_text)
+            if output_match:
+                processing_results["output_path"] = output_match.group(1).strip()
+            
+            # Extract failed files list
+            failed_files_section = False
+            for line in output_text.split('\n'):
+                if '❌ Failed files:' in line:
+                    failed_files_section = True
+                    continue
+                if failed_files_section and line.strip().startswith('- '):
+                    failed_file = line.strip()[2:].strip()
+                    if failed_file:
+                        processing_results["failed_files"].append(failed_file)
+                elif failed_files_section and line.strip() and not line.strip().startswith('- '):
+                    # End of failed files section
+                    break
+            
+            print(f"\n[pdf_processor_node] Processing Summary:")
+            print(f"  Total PDFs: {processing_results['total_count']}")
+            print(f"  Successful: {processing_results['success_count']}")
+            print(f"  Failed: {processing_results['failed_count']}")
+            if processing_results['failed_files']:
+                print(f"  Failed files: {len(processing_results['failed_files'])}")
+            if processing_results['output_path']:
+                print(f"  Output path: {processing_results['output_path']}")
+            
+            # If there are failures, log them but don't stop workflow (as per plan, we stop on script failure, not on individual PDF failures)
+            if processing_results['failed_count'] > 0:
+                print(f"[pdf_processor_node] Warning: {processing_results['failed_count']} PDF(s) failed to process")
+            
+            print(f"[pdf_processor_node] PDF processing completed successfully")
+            
+            return {"pdf_processing_results": processing_results}
+            
+        except subprocess.TimeoutExpired:
+            error_msg = "[pdf_processor_node] Error: Script execution timed out after 1 hour"
+            print(error_msg)
+            raise RuntimeError(error_msg)
+        except FileNotFoundError as e:
+            error_msg = f"[pdf_processor_node] Error: Script or folder not found: {e}"
+            print(error_msg)
+            raise
+        except Exception as e:
+            error_msg = f"[pdf_processor_node] Unexpected error during PDF processing: {e}"
+            print(error_msg)
+            raise RuntimeError(error_msg) from e
+
+    # methods_validator_node - Validate and classify research papers for protein production
+    async def methods_validator_node(state: WorkflowState) -> Dict[str, Any]:
+        """Process JSON files from GROBID output to validate and classify recombinant protein production."""
+        print("\n[methods_validator_node] Starting methods validation and classification...")
+        
+        # Get input directory from environment variable
+        input_dir = os.getenv(
+            "GROBID_OUTPUT_DIR",
+            "/app/grobid_extractor/app/outputs"
+        )
+        input_path = Path(input_dir)
+        
+        # Validate input directory exists
+        if not input_path.exists() or not input_path.is_dir():
+            error_msg = f"[methods_validator_node] Error: Input directory not found or is not a directory: {input_dir}"
+            print(error_msg)
+            raise FileNotFoundError(error_msg)
+        
+        print(f"[methods_validator_node] Input directory: {input_dir}")
+        
+        # Add script directory to Python path
+        script_dir = os.getenv(
+            "METHODS_VALIDATOR_SCRIPT_DIR",
+            "/app/filter1_2/filter_2"
+        )
+        if script_dir not in sys.path:
+            sys.path.insert(0, script_dir)
+        
+        # Import functions from the validation script
+        try:
+            from run_validate_methods_local import (
+                list_local_json_files,
+                read_local_json,
+                extract_structured_text,
+                classify_concatenated_methods,
+                create_summary_dataframe
+            )
+            print(f"[methods_validator_node] Successfully imported validation functions")
+        except ImportError as e:
+            error_msg = f"[methods_validator_node] Error: Failed to import validation functions: {e}"
+            print(error_msg)
+            raise ImportError(error_msg) from e
+        
+        # List JSON files
+        print(f"[methods_validator_node] Listing JSON files from {input_dir}...")
+        json_files = list_local_json_files(input_path)
+        
+        if not json_files:
+            error_msg = f"[methods_validator_node] Error: No JSON files found in {input_dir}"
+            print(error_msg)
+            raise ValueError(error_msg)
+        
+        print(f"[methods_validator_node] Found {len(json_files)} JSON files to process")
+        
+        # Process each file
+        all_results = []
+        error_log = []
+        
+        for file_path in json_files:
+            try:
+                print(f"[methods_validator_node] Processing: {file_path.name}")
+                
+                # Read JSON file
+                data = read_local_json(file_path)
+                
+                # Extract structured text
+                combined_text = extract_structured_text(data)
+                
+                if not combined_text:
+                    result = {
+                        "file": file_path.name,
+                        "file_path": str(file_path),
+                        "combined_methods_length": 0,
+                        "classification": {
+                            "answer": "insufficient_data",
+                            "confidence": 0.0,
+                            "reason": "Empty or missing methods/results sections.",
+                            "recombinant_protein_count": 0,
+                            "recombinant_proteins": [],
+                            "expression_hosts": [],
+                            "host_details": {}
+                        },
+                        "raw_response": ""
+                    }
+                    all_results.append(result)
+                    error_log.append({
+                        "file": result["file"],
+                        "error_type": result["classification"]["answer"],
+                        "reason": result["classification"]["reason"]
+                    })
+                    continue
+                
+                # Classify using LLM
+                classification_result = classify_concatenated_methods(combined_text)
+                classification = classification_result["parsed"]
+                raw_response = classification_result["raw"]
+                
+                # Process and structure protein data
+                proteins = classification.get("recombinant_proteins", [])
+                structured_proteins = []
+                if proteins:
+                    for protein in proteins:
+                        if isinstance(protein, str):
+                            structured_proteins.append({
+                                "name": protein,
+                                "species": "unknown",
+                                "tags": "",
+                                "construct_details": ""
+                            })
+                        elif isinstance(protein, dict):
+                            if "species" not in protein:
+                                protein["species"] = "unknown"
+                            structured_proteins.append(protein)
+                
+                classification["recombinant_proteins"] = structured_proteins
+                classification["recombinant_protein_count"] = len(structured_proteins)
+                
+                # Deduplicate hosts
+                hosts = classification.get("expression_hosts", [])
+                unique_hosts = list(set(hosts)) if hosts else []
+                classification["expression_hosts"] = unique_hosts
+                
+                # Ensure protein_host_pairs exists
+                classification.setdefault("protein_host_pairs", [])
+                
+                result = {
+                    "file": file_path.name,
+                    "file_path": str(file_path),
+                    "combined_methods_length": len(combined_text),
+                    "classification": classification,
+                    "raw_response": raw_response
+                }
+                all_results.append(result)
+                
+                if classification["answer"] in ["error", "insufficient_data"]:
+                    error_log.append({
+                        "file": result["file"],
+                        "error_type": classification["answer"],
+                        "reason": classification["reason"],
+                        "raw_response": raw_response
+                    })
+                
+            except Exception as e:
+                print(f"[methods_validator_node] Error processing {file_path.name}: {e}")
+                error_log.append({
+                    "file": file_path.name,
+                    "error_type": "error",
+                    "reason": f"Exception: {e}"
+                })
+                all_results.append({
+                    "file": file_path.name,
+                    "file_path": str(file_path),
+                    "combined_methods_length": 0,
+                    "classification": {
+                        "answer": "error",
+                        "confidence": 0.0,
+                        "reason": f"Exception: {e}",
+                        "recombinant_proteins": [],
+                        "expression_hosts": [],
+                        "protein_host_pairs": []
+                    },
+                    "raw_response": ""
+                })
+        
+        # Create summary DataFrame
+        print(f"[methods_validator_node] Creating summary DataFrame...")
+        df = create_summary_dataframe(all_results)
+        
+        # Save outputs
+        output_dir = Path("metadata_exports")
+        output_dir.mkdir(exist_ok=True)
+        
+        output_json_path = output_dir / "methods_classification_clean.json"
+        output_csv_path = output_dir / "methods_classification_summary.csv"
+        error_log_path = output_dir / "methods_classification_error_log.json"
+        
+        # Save JSON results
+        with open(output_json_path, "w") as f:
+            json.dump(all_results, f, indent=2)
+        print(f"[methods_validator_node] Saved JSON results to: {output_json_path}")
+        
+        # Save CSV summary
+        df.to_csv(output_csv_path, index=False)
+        print(f"[methods_validator_node] Saved CSV summary to: {output_csv_path}")
+        
+        # Update methods_validation_status in database
+        try:
+            conn = get_db_connection()
+            updated_count = update_methods_validation_from_csv(str(output_csv_path), conn)
+            print(f"[methods_validator_node] Updated {updated_count} rows in metadata_final_filtered with methods_validation_status")
+            conn.close()
+        except Exception as e:
+            print(f"[methods_validator_node] Error updating database: {e}")
+            # Don't fail the node if database update fails
+        
+        # Save error log if any
+        if error_log:
+            with open(error_log_path, "w") as f:
+                json.dump(error_log, f, indent=2)
+            print(f"[methods_validator_node] Saved error log to: {error_log_path}")
+        
+        # Calculate summary statistics
+        total_files = len(all_results)
+        yes_count = sum(1 for r in all_results if r["classification"]["answer"] == "yes")
+        no_count = sum(1 for r in all_results if r["classification"]["answer"] == "no")
+        error_count = len(error_log)
+        
+        validation_results = {
+            "total_files": total_files,
+            "yes_count": yes_count,
+            "no_count": no_count,
+            "error_count": error_count,
+            "output_json_path": str(output_json_path),
+            "output_csv_path": str(output_csv_path),
+            "error_log_path": str(error_log_path) if error_log else None
+        }
+        
+        print(f"\n[methods_validator_node] Validation Summary:")
+        print(f"  Total files processed: {total_files}")
+        print(f"  Recombinant protein production: {yes_count}")
+        print(f"  No recombinant production: {no_count}")
+        print(f"  Errors/Insufficient data: {error_count}")
+        print(f"[methods_validator_node] Methods validation completed successfully")
+        
+        return {"methods_validation_results": validation_results}
 
     # Build workflow graph
     graph = StateGraph(WorkflowState)
@@ -1744,6 +2527,9 @@ def build_workflow(llm_client: 'LLMClient', mcp: 'ProteinSearchClient'):
     graph.add_node("protein_details_node", protein_details_node)
     graph.add_node("metadata_fetcher_node", metadata_fetcher_node)
     graph.add_node("metadata_processor_node", metadata_processor_node)
+    graph.add_node("pdf_downloader_node", pdf_downloader_node)
+    graph.add_node("pdf_processor_node", pdf_processor_node)
+    graph.add_node("methods_validator_node", methods_validator_node)
 
     graph.add_edge(START, "entity_extraction")
 
@@ -1797,8 +2583,11 @@ def build_workflow(llm_client: 'LLMClient', mcp: 'ProteinSearchClient'):
     graph.add_edge("search_clarification", "entity_extraction")  # Loop back to extraction to re-process refinement
     graph.add_edge("select_node", "protein_details_node")  # Go to details after selection
     graph.add_edge("protein_details_node", "metadata_fetcher_node")  # Fetch metadata after details
-    graph.add_edge("metadata_fetcher_node", "metadata_processor_node")  # Process metadata (read from cache/state)
-    graph.add_edge("metadata_processor_node", END)  # End after processing
+    graph.add_edge("metadata_fetcher_node", "metadata_processor_node")  # Process metadata (read from cache)
+    graph.add_edge("metadata_processor_node", "pdf_downloader_node")  # Upload CSV to PDF downloader
+    graph.add_edge("pdf_downloader_node", "pdf_processor_node")  # Process PDFs through GROBID
+    graph.add_edge("pdf_processor_node", "methods_validator_node")  # Validate and classify methods
+    graph.add_edge("methods_validator_node", END)  # End after methods validation
 
     # Compile with checkpointer for persistent state
     checkpointer = MemorySaver()
@@ -2308,9 +3097,8 @@ async def process(llm: LLMClient, mcp: ProteinSearchClient, user_message: str, t
     metadata_summary = None
     if metadata_payload:
         try:
-            # Check if metadata is stored in cache (large dataset)
+            # Metadata is always stored in cache now
             if "cache_id" in metadata_payload:
-                # Large dataset - use summary from payload
                 cache_id = metadata_payload.get("cache_id")
                 summary = metadata_payload.get("summary", {})
                 
@@ -2326,15 +3114,13 @@ async def process(llm: LLMClient, mcp: ProteinSearchClient, user_message: str, t
                     "cache_id": cache_id,  # Include cache_id in response for reference
                 }
             else:
-                # Small dataset - data is in state
-                total_count = metadata_payload.get("shape", [0, 0])[0]
-                if not total_count and metadata_payload.get("records"):
-                    total_count = len(metadata_payload.get("records", []))
+                # Error: cache_id should always be present
+                print("[process] Warning: cache_id not found in metadata_payload. Metadata should always be cached.")
                 metadata_summary = {
-                    "total_count": total_count,
-                    "columns": metadata_payload.get("columns", []),
-                    "shape": metadata_payload.get("shape", [total_count, len(metadata_payload.get("columns", []))]),
-                    "sources": metadata_payload.get("source_counts", {}),
+                    "total_count": 0,
+                    "columns": [],
+                    "shape": [0, 0],
+                    "sources": {},
                 }
         except Exception as e:
             print(f"[process] Error creating metadata summary: {e}")

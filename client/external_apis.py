@@ -24,8 +24,8 @@ async def fetch_metadata(
     Args:
         queries: List of protein names or search terms
         sources: List of sources to search (default: ["pubmed", "semantic_scholar"])
-        start_date: Start date in format "YYYY-MM" (default: "2020-01")
-        end_date: End date in format "YYYY-MM" (default: "2020-03")
+        start_date: Start date in format "YYYY-MM" (default: "2000-01")
+        end_date: End date in format "YYYY-MM" (default: "2024-12")
         intelligent_query: Whether to use intelligent query processing (default: False)
         script_dir: Path to article_fetcher directory (default: from ARTICLE_FETCHER_DIR env var)
     
@@ -35,15 +35,15 @@ async def fetch_metadata(
     if sources is None:
         sources = ["pubmed", "semantic_scholar"]
     if start_date is None:
-        start_date = "2020-01"
+        start_date = "2000-01"
     if end_date is None:
-        end_date = "2020-03"
+        end_date = "2024-12"
     
     # Get script directory
     if script_dir is None:
         script_dir = os.getenv(
             "ARTICLE_FETCHER_DIR",
-            "/Users/eesitasen/Desktop/predictabio/article_fetcher"
+            "/app/article_fetcher"
         )
     
     if not queries:
@@ -68,7 +68,6 @@ async def fetch_metadata(
             return None
         
         print(f"[external_apis] Loading script from: {script_file}")
-        print(f"[external_apis] Article fetcher path: {article_fetcher_path}")
         print(f"[external_apis] Python path includes: {str(article_fetcher_path) in sys.path}")
         
         # Create a unique module name to avoid conflicts
@@ -86,9 +85,6 @@ async def fetch_metadata(
         module.__name__ = module_name
         # Add to sys.modules so imports within the module work correctly
         sys.modules[module_name] = module
-        
-        print(f"[external_apis] Module __file__ set to: {module.__file__}")
-        print(f"[external_apis] Expected parent.parent: {Path(module.__file__).parent.parent}")
         
         # Execute the module (this will run the imports inside the script)
         try:
