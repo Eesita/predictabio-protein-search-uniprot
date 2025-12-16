@@ -1312,6 +1312,23 @@ def build_workflow(llm_client: 'LLMClient', mcp: 'ProteinSearchClient'):
             "chat_history": [{"role": "assistant", "content": message}],  # Auto-append!
         }
 
+    # protein_report_node
+    async def protein_report_node(state: WorkflowState) -> Dict[str, Any]:
+        """Generate protein report message."""
+        print("\n[protein_report_node] Generating protein report...")
+        # Get existing message from protein_details_node
+        existing_message = state.get("assistant_message", "")
+        # Append protein report message
+        report_message = "protein report"
+        if existing_message:
+            message = f"{existing_message}\n\n{report_message}"
+        else:
+            message = report_message
+        return {
+            "assistant_message": message,
+            "chat_history": [{"role": "assistant", "content": report_message}],  # Auto-append!
+        }
+
     # metadata_fetcher_node (API call)
     async def metadata_fetcher_node(state: WorkflowState) -> Dict[str, Any]:
         """Fetch metadata for the selected protein from external sources."""
@@ -2525,6 +2542,7 @@ def build_workflow(llm_client: 'LLMClient', mcp: 'ProteinSearchClient'):
     graph.add_node("search_clarification", search_clarification_node)
     graph.add_node("select_node", select_node)
     graph.add_node("protein_details_node", protein_details_node)
+    graph.add_node("protein_report_node", protein_report_node)
     graph.add_node("metadata_fetcher_node", metadata_fetcher_node)
     graph.add_node("metadata_processor_node", metadata_processor_node)
     graph.add_node("pdf_downloader_node", pdf_downloader_node)
@@ -2582,7 +2600,8 @@ def build_workflow(llm_client: 'LLMClient', mcp: 'ProteinSearchClient'):
     graph.add_edge("narrow_down_node", "search_clarification")
     graph.add_edge("search_clarification", "entity_extraction")  # Loop back to extraction to re-process refinement
     graph.add_edge("select_node", "protein_details_node")  # Go to details after selection
-    graph.add_edge("protein_details_node", "metadata_fetcher_node")  # Fetch metadata after details
+    graph.add_edge("protein_details_node", "protein_report_node")  # Generate protein report after details
+    graph.add_edge("protein_report_node", "metadata_fetcher_node")  # Fetch metadata after report
     graph.add_edge("metadata_fetcher_node", "metadata_processor_node")  # Process metadata (read from cache)
     graph.add_edge("metadata_processor_node", "pdf_downloader_node")  # Upload CSV to PDF downloader
     graph.add_edge("pdf_downloader_node", "pdf_processor_node")  # Process PDFs through GROBID
@@ -2972,10 +2991,167 @@ async def process(llm: LLMClient, mcp: ProteinSearchClient, user_message: str, t
         print(f"[WORKFLOW] No saved state found or error checking state: {e}")
         should_start_fresh = True
     
+    # Use streaming to detect when protein_details_node completes and return early
+    result = None
+    protein_details_completed = False
+    interrupt_detected = False
+    
+    async def process_stream_with_early_return(stream_input):
+        """Process workflow stream, capture protein_details_node result or interrupt, continue in background"""
+        nonlocal result, protein_details_completed, interrupt_detected
+        stream = workflow.astream(stream_input, config=config)
+        
+        # Create a task to consume the stream fully in background
+        async def consume_full_stream():
+            """Consume the entire stream, capturing protein_details_node or interrupts when they appear"""
+            nonlocal result, protein_details_completed, interrupt_detected
+            try:
+                async for update in stream:
+                    # Check which node completed
+                    for node_name, node_state in update.items():
+                        # Check if this is an interrupt node (select_node, narrow_down_node, search_clarification_node)
+                        # These nodes use interrupt() and should have their message in the state
+                        if node_name in ["select_node", "narrow_down_node", "search_clarification_node", "entity_clarification"]:
+                            print(f"[WORKFLOW] Interrupt node {node_name} completed - checking for interrupt message")
+                            # Small delay to ensure state is persisted
+                            await asyncio.sleep(0.2)
+                            # Check workflow state for pending interrupt
+                            reconstructed_message = None
+                            try:
+                                current_state = workflow.get_state(config)
+                                print(f"[WORKFLOW] Current state tasks: {len(current_state.tasks) if current_state and current_state.tasks else 0}")
+                                
+                                state_values = current_state.values if current_state else {}
+                                
+                                # For select_node, we can reconstruct the message from protein_results if needed
+                                if node_name == "select_node":
+                                    results = state_values.get("protein_results", [])
+                                    if results:
+                                        print(f"[WORKFLOW] Reconstructing select_node message from {len(results)} results")
+                                        lines = ["Please select one protein (reply with number or accession):\n"]
+                                        for i, r in enumerate(results[:10], 1):
+                                            accession = getattr(r, 'accession', '') if hasattr(r, 'accession') else str(r.get('accession', ''))
+                                            name = getattr(r, 'name', '') if hasattr(r, 'name') else str(r.get('name', ''))
+                                            organism = getattr(r, 'organism', '') if hasattr(r, 'organism') else str(r.get('organism', ''))
+                                            length = getattr(r, 'length', None) if hasattr(r, 'length') else r.get('length')
+                                            line = f"{i}. {accession} - {name} ({organism})"
+                                            if length:
+                                                line += f" | length: {length} aa"
+                                            lines.append(line)
+                                        reconstructed_message = "\n".join(lines)
+                                        print(f"[WORKFLOW] Reconstructed message: {reconstructed_message[:200]}")
+                                
+                                if current_state and current_state.tasks:
+                                    # Check if there's a pending interrupt
+                                    for task in current_state.tasks:
+                                        if hasattr(task, 'interrupts') and task.interrupts:
+                                            print(f"[WORKFLOW] Interrupt detected in {node_name} - capturing for immediate return")
+                                            # Extract interrupt message from interrupt value
+                                            interrupt_value = task.interrupts[0].value if task.interrupts else None
+                                            print(f"[WORKFLOW] Interrupt value type: {type(interrupt_value)}, value: {str(interrupt_value)[:100] if interrupt_value else None}")
+                                            
+                                            # Extract interrupt message - try multiple sources
+                                            interrupt_message = (
+                                                str(interrupt_value) if interrupt_value else
+                                                state_values.get("assistant_message") or 
+                                                state_values.get("clarification_message") or
+                                                reconstructed_message or
+                                                "Please provide input"
+                                            )
+                                            
+                                            print(f"[WORKFLOW] Interrupt message: {interrupt_message[:200]}")
+                                            
+                                            # Set result with interrupt message and state
+                                            result = dict(state_values)  # Copy all state values
+                                            result["__interrupt__"] = task.interrupts
+                                            # Ensure message is set
+                                            result["assistant_message"] = interrupt_message
+                                            result["clarification_message"] = interrupt_message
+                                            interrupt_detected = True
+                                            break
+                                elif node_name == "select_node" and reconstructed_message:
+                                    # If no interrupt detected but we have select_node, use reconstructed message
+                                    print(f"[WORKFLOW] No interrupt task found, but using reconstructed message for select_node")
+                                    result = dict(state_values)
+                                    result["assistant_message"] = reconstructed_message
+                                    result["clarification_message"] = reconstructed_message
+                                    interrupt_detected = True
+                                else:
+                                    print(f"[WORKFLOW] No tasks found in state after {node_name}")
+                            except Exception as e:
+                                print(f"[WORKFLOW] Error checking for interrupt: {e}")
+                                import traceback
+                                traceback.print_exc()
+                        
+                        # Check for protein_report_node completion (return after this, not protein_details_node)
+                        # This ensures both protein details and report are shown before returning
+                        if node_name == "protein_report_node":
+                            print("[WORKFLOW] protein_report_node completed - capturing result for immediate return")
+                            # Get the full state after protein_report_node completes to ensure we have the combined message
+                            try:
+                                await asyncio.sleep(0.1)  # Small delay to ensure state is persisted
+                                current_state = workflow.get_state(config)
+                                if current_state and current_state.values:
+                                    result = dict(current_state.values)
+                                    print(f"[WORKFLOW] Captured full state with message: {result.get('assistant_message', '')[:200]}")
+                                else:
+                                    # Fallback to node_state if state not available
+                                    result = node_state
+                            except Exception as e:
+                                print(f"[WORKFLOW] Error getting full state, using node_state: {e}")
+                                result = node_state
+                            protein_details_completed = True  # Reusing variable name for early return flag
+                            # Continue consuming the rest in background
+                        elif node_name == "__end__":
+                            # Workflow ended
+                            if not protein_details_completed and not interrupt_detected:
+                                result = node_state
+                            print("[WORKFLOW] Workflow stream completed")
+                            return
+            except Exception as e:
+                print(f"[WORKFLOW] Error in stream consumption: {e}")
+        
+        # Start consuming stream
+        stream_task = asyncio.create_task(consume_full_stream())
+        
+        # Wait until protein_report_node completes or interrupt detected (with timeout)
+        max_wait = 300  # 5 minutes max wait
+        waited = 0
+        while not protein_details_completed and not interrupt_detected and waited < max_wait:
+            await asyncio.sleep(0.1)
+            waited += 0.1
+            # Check if stream task is done (workflow ended before protein_report_node)
+            if stream_task.done():
+                break
+        
+        # If protein_report_node completed or interrupt detected, return immediately (stream continues in background)
+        if protein_details_completed:
+            print("[WORKFLOW] Returning immediately, metadata pipeline continues in background")
+            return
+        elif interrupt_detected:
+            print("[WORKFLOW] Returning interrupt message immediately")
+            return
+        
+        # If we didn't get protein_details_node or interrupt, wait for stream to complete
+        if not stream_task.done():
+            await stream_task
+    
     if is_resuming:
         # Resume from interrupt with user's response (regardless of reset status)
         print("[WORKFLOW] Resuming workflow from interrupt...")
-        result = await workflow.ainvoke(Command(resume=user_message), config=config)
+        # Check if we're already past protein_details_node
+        current_state = workflow.get_state(config)
+        if current_state and current_state.next:
+            next_nodes = current_state.next if isinstance(current_state.next, list) else [current_state.next]
+            next_node_str = str(next_nodes[0]) if next_nodes else ""
+            # If we're already at metadata_fetcher_node or beyond, just run normally
+            if "metadata_fetcher_node" in next_node_str or "metadata_processor_node" in next_node_str:
+                result = await workflow.ainvoke(Command(resume=user_message), config=config)
+            else:
+                # Stream to catch protein_details_node
+                await process_stream_with_early_return(Command(resume=user_message))
+        else:
+            result = await workflow.ainvoke(Command(resume=user_message), config=config)
     elif should_start_fresh:
         # Start fresh with complete state (workflow ended or reset)
         workflow_state = {
@@ -3000,37 +3176,73 @@ async def process(llm: LLMClient, mcp: ProteinSearchClient, user_message: str, t
             "clarification_message": None,
             "protein_metadata": None,
         }
-        print("[WORKFLOW] Running fresh workflow invocation with clean state...")
-        result = await workflow.ainvoke(workflow_state, config=config)
+        print("[WORKFLOW] Running fresh workflow invocation with clean state (streaming)...")
+        await process_stream_with_early_return(workflow_state)
     else:
         # Normal flow: workflow in progress, partial state update
-        # Build partial workflow state update with ONLY the fields we want to change
-        # According to LangGraph quickstart and interrupt docs:
-        # - You can pass a partial state dict when invoking - you don't need all fields
-        # - checkpointer automatically loads saved state for the thread_id when you invoke
-        # - Fields with reducers (like add_messages for chat_history) use the reducer to merge
-        # - chat_history will auto-append the new user message to existing history via add_messages
-        # - query field will update the saved query value
-        # - All other fields are preserved from the saved state automatically
         workflow_state = {
-            "chat_history": [{"role": "user", "content": user_message}],  # Auto-appends via add_messages reducer
-            "query": user_message,  # Update query field
+            "chat_history": [{"role": "user", "content": user_message}],
+            "query": user_message,
         }
-        print("[WORKFLOW] Running fresh workflow invocation (continuing conversation)...")
-        result = await workflow.ainvoke(workflow_state, config=config)
+        print("[WORKFLOW] Running fresh workflow invocation (continuing conversation, streaming)...")
+        await process_stream_with_early_return(workflow_state)
     
-    # Check if new interrupt occurred
-    if "__interrupt__" in result:
-        print("[WORKFLOW] Interrupt detected - returning interrupt message to user")
+    # If we didn't catch protein_report_node (workflow ended early or error), use final result
+    if result is None:
+        # Fallback: get final state
+        final_state = workflow.get_state(config)
+        if final_state:
+            result = final_state.values
+        else:
+            result = {}
+    
+    # Debug: Log what message we're returning
+    if result:
+        msg = result.get("assistant_message") or result.get("clarification_message") or ""
+        if msg:
+            print(f"[WORKFLOW] Returning result with message length: {len(msg)}, preview: {msg[:200]}")
+        else:
+            print(f"[WORKFLOW] Returning result but no message found in result keys: {list(result.keys())}")
+    
+    # Always check workflow state for interrupts (in case streaming didn't catch it)
+    interrupt_message = None
+    try:
+        current_state = workflow.get_state(config)
+        if current_state and current_state.tasks:
+            # Check if there's a pending interrupt
+            for task in current_state.tasks:
+                if hasattr(task, 'interrupts') and task.interrupts:
+                    print("[WORKFLOW] Interrupt found in workflow state - extracting message")
+                    # Extract interrupt message
+                    interrupt_value = task.interrupts[0].value if task.interrupts else None
+                    if interrupt_value:
+                        interrupt_message = str(interrupt_value)
+                        # Also update result with interrupt info
+                        result["__interrupt__"] = task.interrupts
+                        # Get full state values
+                        state_values = current_state.values
+                        result.update(state_values)
+                        # Ensure message is in result
+                        if not result.get("assistant_message"):
+                            result["assistant_message"] = interrupt_message
+                        if not result.get("clarification_message"):
+                            result["clarification_message"] = interrupt_message
+                    break
+    except Exception as e:
+        print(f"[WORKFLOW] Error checking for interrupt in state: {e}")
+    
+    # Also check if interrupt is already in result (from streaming detection)
+    if not interrupt_message and "__interrupt__" in result:
+        print("[WORKFLOW] Interrupt detected in result - extracting message")
         # Extract interrupt message from __interrupt__ list
         interrupts = result.get("__interrupt__", [])
         if interrupts and len(interrupts) > 0:
             # LangGraph interrupt is a list of Interrupt objects with 'value' attribute
             interrupt_obj = interrupts[0]
             if hasattr(interrupt_obj, 'value'):
-                interrupt_message = interrupt_obj.value
+                interrupt_message = str(interrupt_obj.value)
             elif isinstance(interrupt_obj, dict) and 'value' in interrupt_obj:
-                interrupt_message = interrupt_obj['value']
+                interrupt_message = str(interrupt_obj['value'])
             elif isinstance(interrupt_obj, str):
                 interrupt_message = interrupt_obj
     
