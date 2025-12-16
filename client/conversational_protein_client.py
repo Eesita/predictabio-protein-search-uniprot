@@ -18,7 +18,7 @@ import time
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, Dict, Any, List, Tuple, Set, Annotated, Callable, Awaitable
+from typing import Optional, Dict, Any, List, Tuple, Set, Annotated
 from typing_extensions import TypedDict
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import MemorySaver
@@ -1312,13 +1312,27 @@ def build_workflow(llm_client: 'LLMClient', mcp: 'ProteinSearchClient'):
             "chat_history": [{"role": "assistant", "content": message}],  # Auto-append!
         }
 
+    # protein_report_node
+    async def protein_report_node(state: WorkflowState) -> Dict[str, Any]:
+        """Generate protein report message."""
+        print("\n[protein_report_node] Generating protein report...")
+        # Get existing message from protein_details_node
+        existing_message = state.get("assistant_message", "")
+        # Append protein report message
+        report_message = "protein report"
+        if existing_message:
+            message = f"{existing_message}\n\n{report_message}"
+        else:
+            message = report_message
+        return {
+            "assistant_message": message,
+            "chat_history": [{"role": "assistant", "content": report_message}],  # Auto-append!
+        }
+
     # metadata_fetcher_node (API call)
     async def metadata_fetcher_node(state: WorkflowState) -> Dict[str, Any]:
         """Fetch metadata for the selected protein from external sources."""
         print("\n[metadata_fetcher_node] Fetching metadata for selected protein...")
-
-        # TEMP: force an error to validate error handling/logging without touching core logic
-        raise RuntimeError("Intentional test error from metadata_fetcher_node")
 
         selected = state.get("selected_protein")
         if not selected:
@@ -2528,6 +2542,7 @@ def build_workflow(llm_client: 'LLMClient', mcp: 'ProteinSearchClient'):
     graph.add_node("search_clarification", search_clarification_node)
     graph.add_node("select_node", select_node)
     graph.add_node("protein_details_node", protein_details_node)
+    graph.add_node("protein_report_node", protein_report_node)
     graph.add_node("metadata_fetcher_node", metadata_fetcher_node)
     graph.add_node("metadata_processor_node", metadata_processor_node)
     graph.add_node("pdf_downloader_node", pdf_downloader_node)
@@ -2585,7 +2600,8 @@ def build_workflow(llm_client: 'LLMClient', mcp: 'ProteinSearchClient'):
     graph.add_edge("narrow_down_node", "search_clarification")
     graph.add_edge("search_clarification", "entity_extraction")  # Loop back to extraction to re-process refinement
     graph.add_edge("select_node", "protein_details_node")  # Go to details after selection
-    graph.add_edge("protein_details_node", "metadata_fetcher_node")  # Fetch metadata after details
+    graph.add_edge("protein_details_node", "protein_report_node")  # Generate protein report after details
+    graph.add_edge("protein_report_node", "metadata_fetcher_node")  # Fetch metadata after report
     graph.add_edge("metadata_fetcher_node", "metadata_processor_node")  # Process metadata (read from cache)
     graph.add_edge("metadata_processor_node", "pdf_downloader_node")  # Upload CSV to PDF downloader
     graph.add_edge("pdf_downloader_node", "pdf_processor_node")  # Process PDFs through GROBID
@@ -2611,30 +2627,6 @@ def _format_result_list(results: List[Any]) -> str:
             line += f"\n   Length: {entry.length} aa"
         lines.append(line)
     return "\n\n".join(lines)
-
-def _serialize_protein(protein: Any) -> Optional[Dict[str, Any]]:
-    """Serialize a protein object (dataclass or dict) into primitives for JSON/SSE."""
-    if protein is None:
-        return None
-    fields = [
-        "accession",
-        "name",
-        "organism",
-        "description",
-        "gene_names",
-        "keywords",
-        "length",
-        "mass",
-    ]
-    serialized: Dict[str, Any] = {}
-    for field in fields:
-        if isinstance(protein, dict):
-            value = protein.get(field)
-        else:
-            value = getattr(protein, field, None)
-        if value is not None:
-            serialized[field] = value
-    return serialized or None
 
 
 COMMON_ORGANISMS = {
@@ -2910,17 +2902,31 @@ def _build_narrow_prompt(
 # MAIN FLOW
 # ============================================================================
 
-async def process(
-    llm: LLMClient,
-    mcp: ProteinSearchClient,
-    user_message: str,
-    thread_id: str,
-    workflow=None,
-    stream_updates: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None,
-):
+def _serialize_protein(protein: Any) -> Optional[Dict[str, Any]]:
+    """Serialize a protein object to a dictionary for JSON serialization."""
+    if not protein:
+        return None
+    return {
+        "accession": getattr(protein, "accession", None),
+        "name": getattr(protein, "name", None),
+        "organism": getattr(protein, "organism", None),
+        "length": getattr(protein, "length", None),
+        "mass": getattr(protein, "mass", None),
+        "gene_names": getattr(protein, "gene_names", None),
+    }
+
+async def process(llm: LLMClient, mcp: ProteinSearchClient, user_message: str, thread_id: str, workflow=None, stream_updates=None):
     """Process user message through the dynamic workflow with human-in-loop nodes.
     
     State is persisted automatically via the checkpointer, so no state parameter needed.
+    
+    Args:
+        llm: LLM client instance
+        mcp: Protein search client instance
+        user_message: User's message
+        thread_id: Thread ID for state persistence
+        workflow: Optional pre-built workflow (for backward compatibility)
+        stream_updates: Optional async callback function for streaming updates
     """
     print(f"\n{'='*80}")
     print(f"[NEW MESSAGE] {user_message}")
@@ -3051,12 +3057,35 @@ async def process(
             async for update in workflow.astream(invocation_input, config=config, stream_mode="updates"):
                 if not update:
                     continue
+                # Stream protein details when available
                 if "protein_details_node" in update:
                     details_update = update.get("protein_details_node") or {}
                     stream_payload = {
                         "type": "protein_details",
                         "message": details_update.get("assistant_message"),
                         "selected_protein": _serialize_protein(details_update.get("selected_protein")),
+                    }
+                    if stream_payload["message"] or stream_payload["selected_protein"]:
+                        await stream_updates(stream_payload)
+                # Stream protein report when available (includes combined details + report message)
+                if "protein_report_node" in update:
+                    report_update = update.get("protein_report_node") or {}
+                    # Get the full state to include the combined message
+                    current_state = workflow.get_state(config)
+                    combined_message = None
+                    selected_protein = None
+                    if current_state and current_state.values:
+                        combined_message = current_state.values.get("assistant_message")
+                        selected_protein = current_state.values.get("selected_protein")
+                    # Fallback to report_update if state not available
+                    if not combined_message:
+                        combined_message = report_update.get("assistant_message")
+                    if not selected_protein:
+                        selected_protein = report_update.get("selected_protein")
+                    stream_payload = {
+                        "type": "protein_report",
+                        "message": combined_message,
+                        "selected_protein": _serialize_protein(selected_protein),
                     }
                     if stream_payload["message"] or stream_payload["selected_protein"]:
                         await stream_updates(stream_payload)
@@ -3068,7 +3097,116 @@ async def process(
                 if state_snapshot.interrupts:
                     result["__interrupt__"] = list(state_snapshot.interrupts)
         else:
-            result = await workflow.ainvoke(invocation_input, config=config)
+            # Even without stream_updates callback, use streaming to detect early completion
+            # Return immediately after protein_report_node completes, let metadata pipeline continue in background
+            import asyncio
+            early_return_flag = {"completed": False, "result": None}
+            
+            protein_details_seen = False
+            
+            async def consume_stream():
+                """Consume stream and set flag when protein_report_node completes"""
+                nonlocal protein_details_seen
+                try:
+                    async for update in workflow.astream(invocation_input, config=config, stream_mode="updates"):
+                        if not update:
+                            continue
+                        # Check for interrupts - only return early if there's actually a pending interrupt
+                        state_snapshot = workflow.get_state(config)
+                        if state_snapshot and state_snapshot.interrupts:
+                            # There's a pending interrupt - return early
+                            early_return_flag["result"] = dict(state_snapshot.values)
+                            early_return_flag["result"]["__interrupt__"] = list(state_snapshot.interrupts)
+                            early_return_flag["completed"] = True
+                            return
+                        # Check for protein_details_node completion
+                        if "protein_details_node" in update:
+                            print("[WORKFLOW] protein_details_node completed - waiting for protein_report_node")
+                            protein_details_seen = True
+                        # Check for protein_report_node completion
+                        if "protein_report_node" in update:
+                            print("[WORKFLOW] protein_report_node completed - returning early, metadata pipeline continues in background")
+                            state_snapshot = workflow.get_state(config)
+                            if state_snapshot:
+                                early_return_flag["result"] = dict(state_snapshot.values)
+                                if state_snapshot.interrupts:
+                                    early_return_flag["result"]["__interrupt__"] = list(state_snapshot.interrupts)
+                            early_return_flag["completed"] = True
+                            # Continue consuming in background (don't return, let it finish)
+                        # Check if workflow ended
+                        if "__end__" in update:
+                            if not early_return_flag["completed"]:
+                                state_snapshot = workflow.get_state(config)
+                                if state_snapshot:
+                                    early_return_flag["result"] = dict(state_snapshot.values)
+                                    if state_snapshot.interrupts:
+                                        early_return_flag["result"]["__interrupt__"] = list(state_snapshot.interrupts)
+                            return
+                except Exception as stream_e:
+                    print(f"[WORKFLOW] Stream error: {stream_e}")
+                    import traceback
+                    traceback.print_exc()
+            
+            # Start consuming stream in background
+            stream_task = asyncio.create_task(consume_stream())
+            
+            # Wait for protein_report_node or interrupt with timeout
+            # Also periodically check state in case we missed the update
+            max_wait = 300  # 5 minutes max wait
+            protein_details_timeout = 3.0  # Wait up to 3 seconds for protein_report_node after protein_details
+            waited = 0
+            check_interval = 0.5  # Check state every 0.5 seconds
+            last_check = 0
+            protein_details_time = None
+            
+            while not early_return_flag["completed"] and waited < max_wait:
+                await asyncio.sleep(0.1)
+                waited += 0.1
+                
+                # Track when protein_details_node was seen
+                if protein_details_seen and protein_details_time is None:
+                    protein_details_time = waited
+                
+                # Periodically check state to see if protein_report_node completed
+                if waited - last_check >= check_interval:
+                    last_check = waited
+                    state_snapshot = workflow.get_state(config)
+                    if state_snapshot:
+                        # If we've seen protein_details_node and there's no interrupt, check if we have a message
+                        if protein_details_seen and not state_snapshot.interrupts:
+                            assistant_message = state_snapshot.values.get("assistant_message")
+                            selected_protein = state_snapshot.values.get("selected_protein")
+                            # If we have both message and selected_protein, we're past protein_details_node
+                            if assistant_message and selected_protein:
+                                # Check if message contains "protein report" or if it's longer than typical protein_details message
+                                # (protein_report_node appends to the message, so it should be longer)
+                                if "protein report" in assistant_message.lower() or len(assistant_message) > 100:
+                                    print("[WORKFLOW] Detected protein_report_node completion via state check - returning early")
+                                    early_return_flag["result"] = dict(state_snapshot.values)
+                                    early_return_flag["completed"] = True
+                                    break
+                                # Fallback: if we've waited long enough after protein_details_node, return with what we have
+                                elif protein_details_time and (waited - protein_details_time) >= protein_details_timeout:
+                                    print("[WORKFLOW] Timeout waiting for protein_report_node - returning with protein_details")
+                                    early_return_flag["result"] = dict(state_snapshot.values)
+                                    early_return_flag["completed"] = True
+                                    break
+                
+                if stream_task.done():
+                    break
+            
+            # Get result from flag or final state
+            if early_return_flag["result"]:
+                result = early_return_flag["result"]
+            else:
+                # Stream completed without early return - get final state
+                state_snapshot = workflow.get_state(config)
+                if state_snapshot:
+                    result = dict(state_snapshot.values)
+                    if state_snapshot.interrupts:
+                        result["__interrupt__"] = list(state_snapshot.interrupts)
+            
+            # Don't await stream_task - let it continue in background for metadata processing
     except Exception as e:
         # Suppress user-facing errors from long-running metadata/PDF/methods nodes
         print(f"[WORKFLOW] Error during long-running phase: {e}")
@@ -3088,18 +3226,18 @@ async def process(
             "protein_metadata": None,
         }
     
-    # Check if new interrupt occurred
-    if "__interrupt__" in result:
-        print("[WORKFLOW] Interrupt detected - returning interrupt message to user")
+    # Also check if interrupt is already in result (from streaming detection)
+    if not interrupt_message and "__interrupt__" in result:
+        print("[WORKFLOW] Interrupt detected in result - extracting message")
         # Extract interrupt message from __interrupt__ list
         interrupts = result.get("__interrupt__", [])
         if interrupts and len(interrupts) > 0:
             # LangGraph interrupt is a list of Interrupt objects with 'value' attribute
             interrupt_obj = interrupts[0]
             if hasattr(interrupt_obj, 'value'):
-                interrupt_message = interrupt_obj.value
+                interrupt_message = str(interrupt_obj.value)
             elif isinstance(interrupt_obj, dict) and 'value' in interrupt_obj:
-                interrupt_message = interrupt_obj['value']
+                interrupt_message = str(interrupt_obj['value'])
             elif isinstance(interrupt_obj, str):
                 interrupt_message = interrupt_obj
     
@@ -3209,7 +3347,6 @@ async def process(
         "search_attempts": len(result.get("search_attempts", [])),
         "retry_count": result.get("retry_count", 0),
         "protein_metadata": metadata_summary,  # Summary only for API (DataFrame stays in state)
-        "conversation_id": thread_id,
     }
     
     return final_message or "", workflow_details
@@ -3234,20 +3371,9 @@ class ProteinClient:
     async def stop(self):
         await self.mcp.stop_server()
     
-    async def ask(
-        self,
-        question: str,
-        conversation_id: Optional[str] = None,
-        stream_updates: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None,
-    ) -> tuple[str, Dict[str, Any]]:
+    async def ask(self, question: str, conversation_id: Optional[str] = None) -> tuple[str, Dict[str, Any]]:
         # Use provided conversation_id or default thread_id
         thread = conversation_id if conversation_id else self.thread_id
-        response, workflow_details = await process(
-            self.llm,
-            self.mcp,
-            question,
-            thread,
-            self.workflow,
-            stream_updates=stream_updates,
-        )
+        response, workflow_details = await process(self.llm, self.mcp, question, thread, self.workflow)
         return response, workflow_details
+
