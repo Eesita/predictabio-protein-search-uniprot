@@ -487,25 +487,49 @@
                 let buffer = '';
                 let finalPayload = null;
 
+                let receivedContent = ""; // Track what we have shown so far
+
                 const handlePayload = async (payload) => {
-                    if (payload.type === 'protein_details' && payload.message) {
-                        addMessage('assistant', payload.message);
+                    let newContent = "";
+                    let isUpdate = false;
+
+                    if (payload.type === 'protein_details') {
+                        newContent = payload.message;
+                        isUpdate = true;
+                    } else if (payload.type === 'protein_report') {
+                        newContent = payload.message;
+                        isUpdate = true;
                     } else if (payload.type === 'final') {
+                        newContent = payload.response;
                         finalPayload = payload;
                         if (payload.conversation_id) {
                             currentConversationId = payload.conversation_id;
                         }
-
                         hideTypingIndicator();
+                    } else if (payload.type === 'error') {
+                        throw new Error(payload.message || 'Streaming error');
+                    }
 
-                        // Only render final message if it's different AND not a duplicate protein details header
-                        const finalText = payload.response || 'No response available.';
-                        const isProteinDetails = finalText.trim().startsWith('Confirmed protein details:');
-                        const alreadyShownDetails = lastAssistantMessage && lastAssistantMessage.trim().startsWith('Confirmed protein details:');
-                        if (finalText !== lastAssistantMessage && !(isProteinDetails && alreadyShownDetails)) {
-                            addMessage('assistant', finalText);
+                    if (newContent) {
+                        // Deduplication / Extension logic
+                        if (receivedContent && newContent.startsWith(receivedContent) && newContent.length > receivedContent.length) {
+                             // It's an extension - show only the new part
+                             const chunk = newContent.substring(receivedContent.length).trim();
+                             if (chunk) {
+                                 addMessage('assistant', chunk);
+                             }
+                             receivedContent = newContent;
+                        } else if (newContent !== receivedContent) {
+                             // If it's the first message or a completely different one
+                             // (But avoid re-printing if final is just a prefix of what we already have, which shouldn't happen)
+                             if (receivedContent === "" || !receivedContent.startsWith(newContent)) {
+                                 addMessage('assistant', newContent);
+                                 receivedContent = newContent;
+                             }
                         }
+                    }
 
+                    if (payload.type === 'final') {
                         // Store conversation history with workflow details
                         conversationHistory.push({
                             role: 'user', 
@@ -525,8 +549,6 @@
 
                         // Update status
                         updateStatus('connected');
-                    } else if (payload.type === 'error') {
-                        throw new Error(payload.message || 'Streaming error');
                     }
                 };
 

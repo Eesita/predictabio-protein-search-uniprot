@@ -3075,8 +3075,9 @@ async def process(llm: LLMClient, mcp: ProteinSearchClient, user_message: str, t
                     combined_message = None
                     selected_protein = None
                     if current_state and current_state.values:
-                        combined_message = current_state.values.get("assistant_message")
-                        selected_protein = current_state.values.get("selected_protein")
+                        # Prefer the output from the update itself if available, as state might be slightly behind
+                        combined_message = report_update.get("assistant_message") or current_state.values.get("assistant_message")
+                        selected_protein = report_update.get("selected_protein") or current_state.values.get("selected_protein")
                     # Fallback to report_update if state not available
                     if not combined_message:
                         combined_message = report_update.get("assistant_message")
@@ -3371,9 +3372,9 @@ class ProteinClient:
     async def stop(self):
         await self.mcp.stop_server()
     
-    async def ask(self, question: str, conversation_id: Optional[str] = None) -> tuple[str, Dict[str, Any]]:
+    async def ask(self, question: str, conversation_id: Optional[str] = None, stream_updates=None) -> tuple[str, Dict[str, Any]]:
         # Use provided conversation_id or default thread_id
         thread = conversation_id if conversation_id else self.thread_id
-        response, workflow_details = await process(self.llm, self.mcp, question, thread, self.workflow)
+        response, workflow_details = await process(self.llm, self.mcp, question, thread, self.workflow, stream_updates=stream_updates)
         return response, workflow_details
 
